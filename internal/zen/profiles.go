@@ -100,7 +100,9 @@ func parseINI(path string) ([]iniSection, error) {
 }
 
 func resolve(root, p, isRelative string) string {
-	if isRelative == "1" {
+	// installs.ini has no IsRelative flag and uses absolute paths for
+	// profiles outside the data dir (e.g. Scoop's persist folder).
+	if isRelative == "1" && !filepath.IsAbs(p) {
 		return filepath.Join(root, filepath.FromSlash(p))
 	}
 	return filepath.Clean(p)
@@ -188,24 +190,24 @@ func RegisterProfile(root, name, dir string) error {
 		return n, err == nil && strings.HasPrefix(s.name, "Profile")
 	})
 	next := lo.Ternary(len(indexes) == 0, 0, lo.Max(indexes)+1)
-	rel, err := filepath.Rel(root, dir)
-	isRel := "1"
-	if err != nil || strings.HasPrefix(rel, "..") {
-		rel, isRel = dir, "0"
+
+	path, isRelative := dir, "0"
+	if rel, err := filepath.Rel(root, dir); err == nil && !strings.HasPrefix(rel, "..") {
+		path, isRelative = filepath.ToSlash(rel), "1"
 	}
+
 	data, err := os.ReadFile(iniPath)
 	if err != nil {
 		return err
 	}
-	nl := "\n"
-	if strings.Contains(string(data), "\r\n") {
-		nl = "\r\n"
+	// Match the file's existing line endings (CRLF on Windows).
+	content := string(data)
+	nl := lo.Ternary(strings.Contains(content, "\r\n"), "\r\n", "\n")
+	lines := []string{"", fmt.Sprintf("[Profile%d]", next), "Name=" + name, "IsRelative=" + isRelative, "Path=" + path, ""}
+	if content != "" && !strings.HasSuffix(content, "\n") {
+		lines = append([]string{""}, lines...)
 	}
-	section := fmt.Sprintf("%s[Profile%d]%sName=%s%sIsRelative=%s%sPath=%s%s",
-		nl, next, nl, name, nl, isRel, nl, filepath.ToSlash(rel), nl)
-	if len(data) > 0 && !strings.HasSuffix(string(data), "\n") {
-		section = nl + section
-	}
+	section := strings.Join(lines, nl)
 	f, err := os.OpenFile(iniPath, os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {
 		return err
@@ -223,13 +225,10 @@ func Version(profileDir string) string {
 	if err != nil {
 		return ""
 	}
-	for _, s := range secs {
-		if v := s.kv["LastVersion"]; v != "" {
-			v, _, _ = strings.Cut(v, "_")
-			return v
-		}
-	}
-	return ""
+	section, _ := lo.Find(secs, func(s iniSection) bool { return s.kv["LastVersion"] != "" })
+	// LastVersion looks like "1.23.4b_20261020090730/20261020090730".
+	version, _, _ := strings.Cut(section.kv["LastVersion"], "_")
+	return version
 }
 
 func fileExists(p string) bool {

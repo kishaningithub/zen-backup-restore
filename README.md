@@ -79,7 +79,7 @@ zen-backup-restore restore backup.tar.gz -p "Default (release)" -y   # overwrite
 Run `zen-backup-restore --help` (or `<command> --help`) for all flags. Shell completion scripts are available via `zen-backup-restore completion bash|zsh|fish|powershell`.
 
 Backups go to `~/Backups/ZenBrowser` by default. Change this with `--backup-dir` or `ZEN_BACKUP_DIR`.
-Zen's data dir is auto-detected (including Flatpak and Snap on Linux). Override it with `--zen-dir`.
+Zen's data dir is auto-detected (including Flatpak and Snap on Linux). Override it with `--zen-dir`. Profiles stored outside it, such as the "Scoop" profile created by `scoop install extras/zen-browser`, are picked up from `profiles.ini`.
 
 **Quit Zen before backing up or restoring.** The tool checks Zen's profile lock and refuses to run while the profile is in use.
 

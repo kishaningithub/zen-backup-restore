@@ -4,34 +4,74 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+}
 
 func TestListAndRegisterProfiles(t *testing.T) {
 	root := t.TempDir()
-	ini := "[Install123]\nDefault=Profiles/b.Second\nLocked=1\n\n" +
-		"[Profile0]\nName=First\nIsRelative=1\nPath=Profiles/a.First\nDefault=1\n\n" +
-		"[Profile1]\nName=Second\nIsRelative=1\nPath=Profiles/b.Second\n\n" +
-		"[General]\nStartWithLastProfile=1\nVersion=2\n"
-	os.WriteFile(filepath.Join(root, "profiles.ini"), []byte(ini), 0o644)
+	writeFile(t, filepath.Join(root, "profiles.ini"), `[Install123]
+Default=Profiles/b.Second
+Locked=1
 
-	ps, err := ListProfiles(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(ps) != 2 || ps[0].Name != "Second" || !ps[0].Default || ps[1].Default {
-		t.Fatalf("install default should win and sort first: %+v", ps)
-	}
+[Profile0]
+Name=First
+IsRelative=1
+Path=Profiles/a.First
+Default=1
+
+[Profile1]
+Name=Second
+IsRelative=1
+Path=Profiles/b.Second
+
+[General]
+StartWithLastProfile=1
+Version=2
+`)
+
+	profiles, err := ListProfiles(root)
+	require.NoError(t, err)
+	require.Equal(t, []Profile{
+		{Name: "Second", Path: filepath.Join(root, "Profiles", "b.Second"), Default: true},
+		{Name: "First", Path: filepath.Join(root, "Profiles", "a.First")},
+	}, profiles, "install default should win and sort first")
 
 	dir, err := NewProfileDir(root, "Restored")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := RegisterProfile(root, "Restored", dir); err != nil {
-		t.Fatal(err)
-	}
-	ps, _ = ListProfiles(root)
-	p, err := FindProfile(ps, "restored")
-	if err != nil || p.Path != dir {
-		t.Fatalf("registered profile not found: %+v %v", p, err)
-	}
+	require.NoError(t, err)
+	require.NoError(t, RegisterProfile(root, "Restored", dir))
+
+	profiles, err = ListProfiles(root)
+	require.NoError(t, err)
+	restored, err := FindProfile(profiles, "restored")
+	require.NoError(t, err)
+	require.Equal(t, dir, restored.Path)
+}
+
+// Scoop's zen-browser manifest registers a profile outside the Zen data dir
+// (in Scoop's persist folder) with an absolute path, and installs.ini then
+// points at that absolute path.
+func TestAbsoluteProfilePathAsInstallDefault(t *testing.T) {
+	root := t.TempDir()
+	scoopProfile := filepath.Join(t.TempDir(), "persist", "zen-browser", "profile")
+	writeFile(t, filepath.Join(root, "profiles.ini"), `[Profile0]
+Name=Default (release)
+IsRelative=1
+Path=Profiles/a.Default
+
+[Profile1]
+Name=Scoop
+IsRelative=0
+Path=`+scoopProfile+`
+`)
+	writeFile(t, filepath.Join(root, "installs.ini"), "[ABC]\nDefault="+scoopProfile+"\nLocked=1\n")
+
+	profiles, err := ListProfiles(root)
+	require.NoError(t, err)
+	require.Equal(t, Profile{Name: "Scoop", Path: scoopProfile, Default: true}, profiles[0])
 }

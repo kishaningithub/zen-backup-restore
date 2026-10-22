@@ -5,6 +5,7 @@ go 1.27.3
 require (
 	github.com/samber/lo v1.53.0
 	github.com/spf13/cobra v1.10.2
+	github.com/stretchr/testify v1.12.1
 	golang.org/x/term v0.47.0
 )
 
@@ -420,7 +421,6 @@ require (
 	github.com/ssgreg/nlreturn/v2 v2.2.1 // indirect
 	github.com/stbenjam/no-sprintf-host-port v0.3.1 // indirect
 	github.com/stretchr/objx v0.5.3 // indirect
-	github.com/stretchr/testify v1.12.1 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
 	github.com/tetafro/godot v1.5.6 // indirect
 	github.com/theupdateframework/go-tuf v0.7.0 // indirect

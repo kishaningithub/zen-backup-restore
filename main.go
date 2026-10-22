@@ -160,22 +160,22 @@ func loadProfiles(c config) (string, []zen.Profile, error) {
 	return root, profiles, nil
 }
 
+func isUsedProfile(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, "places.sqlite"))
+	return err == nil
+}
+
 func profileLabel(p zen.Profile) string {
-	var tags []string
-	if p.Default {
-		tags = append(tags, "default")
-	}
-	if zen.InUse(p.Path) {
-		tags = append(tags, "in use")
-	}
-	if _, err := os.Stat(filepath.Join(p.Path, "places.sqlite")); err != nil {
-		tags = append(tags, "empty")
-	}
-	l := p.Name
+	tags := lo.Compact([]string{
+		lo.Ternary(p.Default, "default", ""),
+		lo.Ternary(zen.InUse(p.Path), "in use", ""),
+		lo.Ternary(isUsedProfile(p.Path), "", "empty"),
+	})
+	label := p.Name
 	if len(tags) > 0 {
-		l += " [" + strings.Join(tags, ", ") + "]"
+		label += " [" + strings.Join(tags, ", ") + "]"
 	}
-	return l + "\n      " + p.Path
+	return label + "\n      " + p.Path
 }
 
 func pickProfile(ui *ui, profiles []zen.Profile, query, prompt string) (zen.Profile, error) {
@@ -204,7 +204,8 @@ func cmdList(c config) error {
 	for _, p := range profiles {
 		fmt.Printf("  - %s\n", profileLabel(p))
 	}
-	backups, _ := findBackups(c.backupDir)
+
+	backups := findBackups(c.backupDir)
 	fmt.Printf("\nBackups in %s:\n", c.backupDir)
 	if len(backups) == 0 {
 		fmt.Println("  (none)")
@@ -224,7 +225,7 @@ func cmdBackup(c config, ui *ui) error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(filepath.Join(p.Path, "places.sqlite")); err != nil {
+	if !isUsedProfile(p.Path) {
 		return fmt.Errorf("%s doesn't look like a used Zen profile (no places.sqlite)", p.Path)
 	}
 	if zen.InUse(p.Path) {
@@ -234,28 +235,34 @@ func cmdBackup(c config, ui *ui) error {
 		fmt.Fprintln(os.Stderr, "warning: Zen is running; the backup may be inconsistent")
 	}
 
-	now := time.Now()
-	out := c.output
-	switch {
-	case out == "":
-		out = filepath.Join(c.backupDir, backup.ArchiveName(p.Name, now))
-	case !strings.HasSuffix(out, ".tar.gz") && !strings.HasSuffix(out, ".tgz"):
-		out = filepath.Join(out, backup.ArchiveName(p.Name, now))
-	}
-
+	out := archivePath(c, p.Name)
 	fmt.Printf("Backing up %q\n  from %s\n  to   %s\n", p.Name, p.Path, out)
 	m, err := backup.Create(p.Path, p.Name, zen.Version(p.Path), out, backup.Options{Slim: c.slim}, progressPrinter())
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
 		return err
 	}
-	st, _ := os.Stat(out)
-	var size int64
-	if st != nil {
-		size = st.Size()
-	}
-	fmt.Printf("Done: %d files, %s of profile data -> %s archive\n%s\n", m.Files, humanBytes(m.Bytes), humanBytes(size), out)
+	fmt.Printf("Done: %d files, %s of profile data -> %s archive\n%s\n",
+		m.Files, humanBytes(m.Bytes), humanBytes(fileSize(out)), out)
 	return nil
+}
+
+// archivePath returns where to write a new backup: --output if it names an
+// archive, otherwise a timestamped file in --output or --backup-dir.
+func archivePath(c config, profileName string) string {
+	if strings.HasSuffix(c.output, ".tar.gz") || strings.HasSuffix(c.output, ".tgz") {
+		return c.output
+	}
+	dir := lo.Ternary(c.output != "", c.output, c.backupDir)
+	return filepath.Join(dir, backup.ArchiveName(profileName, time.Now()))
+}
+
+func fileSize(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
 }
 
 type backupInfo struct {
@@ -264,146 +271,168 @@ type backupInfo struct {
 	err      error
 }
 
-func findBackups(dir string) ([]backupInfo, error) {
+// findBackups lists the archives in dir, newest first.
+func findBackups(dir string) []backupInfo {
 	paths := lo.FlatMap([]string{"*.tar.gz", "*.tgz"}, func(pattern string, _ int) []string {
 		matches, _ := filepath.Glob(filepath.Join(dir, pattern))
 		return matches
 	})
-	out := lo.Map(paths, func(p string, _ int) backupInfo {
+	backups := lo.Map(paths, func(p string, _ int) backupInfo {
 		m, err := backup.ReadManifest(p)
 		return backupInfo{p, m, err}
 	})
-	slices.SortFunc(out, func(a, b backupInfo) int { return b.manifest.CreatedAt.Compare(a.manifest.CreatedAt) })
-	return out, nil
+	slices.SortFunc(backups, func(a, b backupInfo) int { return b.manifest.CreatedAt.Compare(a.manifest.CreatedAt) })
+	return backups
 }
 
 func backupLabel(b backupInfo) string {
+	name := filepath.Base(b.path)
 	if b.err != nil {
-		return filepath.Base(b.path) + " (unreadable: " + b.err.Error() + ")"
+		return name + " (unreadable: " + b.err.Error() + ")"
 	}
 	m := b.manifest
-	extra := ""
-	if m.ZenVersion != "" {
-		extra += ", Zen " + m.ZenVersion
-	}
-	if m.Slim {
-		extra += ", slim"
-	}
-	return fmt.Sprintf("%s\n      profile %q from %s, %s%s, %s",
-		filepath.Base(b.path), m.ProfileName, m.OS,
-		m.CreatedAt.Local().Format("2006-01-02 15:04"), extra, humanBytes(m.Bytes))
+	details := lo.Compact([]string{
+		fmt.Sprintf("profile %q from %s", m.ProfileName, m.OS),
+		m.CreatedAt.Local().Format("2006-01-02 15:04"),
+		lo.Ternary(m.ZenVersion != "", "Zen "+m.ZenVersion, ""),
+		lo.Ternary(m.Slim, "slim", ""),
+		humanBytes(m.Bytes),
+	})
+	return name + "\n      " + strings.Join(details, ", ")
 }
 
 func cmdRestore(c config, ui *ui, archive string) error {
 	if archive == "" {
-		backups, _ := findBackups(c.backupDir)
-		valid := lo.Filter(backups, func(b backupInfo, _ int) bool { return b.err == nil })
-		if len(valid) == 0 {
-			return fmt.Errorf("no backups found in %s; pass the archive path explicitly", c.backupDir)
-		}
-		if !ui.tty {
-			return errors.New("specify the archive to restore")
-		}
-		labels := lo.Map(valid, func(b backupInfo, _ int) string { return backupLabel(b) })
-		i, err := ui.choose("Which backup do you want to restore?", labels, 0)
-		if err != nil {
+		var err error
+		if archive, err = chooseArchive(c, ui); err != nil {
 			return err
 		}
-		archive = valid[i].path
 	}
 	m, err := backup.ReadManifest(archive)
 	if err != nil {
 		return err
 	}
-
 	root, profiles, err := loadProfiles(c)
 	if err != nil {
 		return err
 	}
 
-	newName := c.newName
-	var target zen.Profile
-	switch {
-	case newName == "" && c.profile != "":
-		if target, err = zen.FindProfile(profiles, c.profile); err != nil {
-			return err
-		}
-	case newName == "":
-		if !ui.tty {
-			return errors.New("specify --profile to overwrite or --new to create a profile")
-		}
-		labels := append([]string{"Create a new profile (safest)"},
-			lo.Map(profiles, func(p zen.Profile, _ int) string { return "Overwrite " + profileLabel(p) })...)
-		i, err := ui.choose("Restore into:", labels, 0)
-		if err != nil {
-			return err
-		}
-		if i == 0 {
-			def := m.ProfileName + " restored"
-			if newName, err = ui.ask(fmt.Sprintf("Name for the new profile [%s]: ", def)); err != nil {
-				return err
-			}
-			if newName == "" {
-				newName = def
-			}
-		} else {
-			target = profiles[i-1]
-		}
+	target, newName, err := chooseRestoreTarget(c, ui, profiles, m.ProfileName+" restored")
+	if err != nil {
+		return err
 	}
-
 	if newName != "" {
-		if lo.SomeBy(profiles, func(p zen.Profile) bool { return zen.InUse(p.Path) }) {
-			return errors.New("quit Zen before creating a new profile (it rewrites profiles.ini on exit)")
-		}
-		if lo.SomeBy(profiles, func(p zen.Profile) bool { return strings.EqualFold(p.Name, newName) }) {
-			return fmt.Errorf("a profile named %q already exists", newName)
-		}
-		dir, err := zen.NewProfileDir(root, sanitizeDirName(newName))
-		if err != nil {
-			return err
-		}
-		fmt.Printf("Restoring %s\n  into new profile %q at %s\n", filepath.Base(archive), newName, dir)
-		if _, err := backup.Restore(archive, dir, false, progressPrinter()); err != nil {
-			fmt.Fprintln(os.Stderr)
-			return err
-		}
-		fmt.Fprintln(os.Stderr)
-		if err := zen.RegisterProfile(root, newName, dir); err != nil {
-			return fmt.Errorf("profile restored to %s but registering it in profiles.ini failed: %w", dir, err)
-		}
-		fmt.Printf("Done. Pick %q in about:profiles, or launch with:\n  zen --profile %q\n", newName, dir)
-		return nil
+		return restoreIntoNewProfile(root, profiles, archive, newName)
+	}
+	return restoreOverProfile(c, ui, archive, target)
+}
+
+func chooseArchive(c config, ui *ui) (string, error) {
+	backups := lo.Filter(findBackups(c.backupDir), func(b backupInfo, _ int) bool { return b.err == nil })
+	if len(backups) == 0 {
+		return "", fmt.Errorf("no backups found in %s; pass the archive path explicitly", c.backupDir)
+	}
+	if !ui.tty {
+		return "", errors.New("specify the archive to restore")
+	}
+	labels := lo.Map(backups, func(b backupInfo, _ int) string { return backupLabel(b) })
+	i, err := ui.choose("Which backup do you want to restore?", labels, 0)
+	if err != nil {
+		return "", err
+	}
+	return backups[i].path, nil
+}
+
+// chooseRestoreTarget returns either an existing profile to overwrite or the
+// name of a new profile to create, from flags or by asking.
+func chooseRestoreTarget(c config, ui *ui, profiles []zen.Profile, defaultNewName string) (zen.Profile, string, error) {
+	switch {
+	case c.newName != "":
+		return zen.Profile{}, c.newName, nil
+	case c.profile != "":
+		target, err := zen.FindProfile(profiles, c.profile)
+		return target, "", err
+	case !ui.tty:
+		return zen.Profile{}, "", errors.New("specify --profile to overwrite or --new to create a profile")
 	}
 
+	labels := append([]string{"Create a new profile (safest)"},
+		lo.Map(profiles, func(p zen.Profile, _ int) string { return "Overwrite " + profileLabel(p) })...)
+	i, err := ui.choose("Restore into:", labels, 0)
+	if err != nil {
+		return zen.Profile{}, "", err
+	}
+	if i > 0 {
+		return profiles[i-1], "", nil
+	}
+	name, err := ui.ask(fmt.Sprintf("Name for the new profile [%s]: ", defaultNewName))
+	return zen.Profile{}, lo.Ternary(name != "", name, defaultNewName), err
+}
+
+func restoreIntoNewProfile(root string, profiles []zen.Profile, archive, name string) error {
+	if lo.SomeBy(profiles, func(p zen.Profile) bool { return zen.InUse(p.Path) }) {
+		return errors.New("quit Zen before creating a new profile (it rewrites profiles.ini on exit)")
+	}
+	if lo.SomeBy(profiles, func(p zen.Profile) bool { return strings.EqualFold(p.Name, name) }) {
+		return fmt.Errorf("a profile named %q already exists", name)
+	}
+	dir, err := zen.NewProfileDir(root, sanitizeDirName(name))
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Restoring %s\n  into new profile %q at %s\n", filepath.Base(archive), name, dir)
+	_, err = backup.Restore(archive, dir, false, progressPrinter())
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return err
+	}
+	if err := zen.RegisterProfile(root, name, dir); err != nil {
+		return fmt.Errorf("profile restored to %s but registering it in profiles.ini failed: %w", dir, err)
+	}
+	fmt.Printf("Done. Pick %q in about:profiles, or launch with:\n  zen --profile %q\n", name, dir)
+	return nil
+}
+
+func restoreOverProfile(c config, ui *ui, archive string, target zen.Profile) error {
 	if zen.InUse(target.Path) {
 		return fmt.Errorf("zen is running with profile %q; quit it first", target.Name)
 	}
 	fmt.Printf("Restoring %s\n  over profile %q at %s\n", filepath.Base(archive), target.Name, target.Path)
-	if !c.noKeepOld {
-		fmt.Println("  (the current profile will be kept as a .pre-restore copy)")
-	} else {
+	if c.noKeepOld {
 		fmt.Println("  WARNING: the current profile will be deleted")
+	} else {
+		fmt.Println("  (the current profile will be kept as a .pre-restore copy)")
 	}
-	if !c.yes {
-		if !ui.tty {
-			return errors.New("refusing to overwrite without confirmation; pass --yes")
-		}
-		ok, err := ui.confirm("Continue?")
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return errors.New("aborted")
-		}
+	if err := confirmOverwrite(c, ui); err != nil {
+		return err
 	}
-	res, err := backup.Restore(archive, target.Path, !c.noKeepOld, progressPrinter())
+
+	result, err := backup.Restore(archive, target.Path, !c.noKeepOld, progressPrinter())
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
 		return err
 	}
 	fmt.Println("Done. Start Zen to use the restored profile.")
-	if res.PreviousDir != "" {
-		fmt.Printf("Previous profile kept at:\n  %s\nDelete it once you're happy with the restore.\n", res.PreviousDir)
+	if result.PreviousDir != "" {
+		fmt.Printf("Previous profile kept at:\n  %s\nDelete it once you're happy with the restore.\n", result.PreviousDir)
+	}
+	return nil
+}
+
+func confirmOverwrite(c config, ui *ui) error {
+	if c.yes {
+		return nil
+	}
+	if !ui.tty {
+		return errors.New("refusing to overwrite without confirmation; pass --yes")
+	}
+	ok, err := ui.confirm("Continue?")
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("aborted")
 	}
 	return nil
 }
@@ -412,10 +441,7 @@ var badDirChars = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1f]+`)
 
 func sanitizeDirName(s string) string {
 	s = strings.TrimSpace(badDirChars.ReplaceAllString(s, "-"))
-	if s == "" {
-		return "restored"
-	}
-	return s
+	return lo.Ternary(s != "", s, "restored")
 }
 
 func progressPrinter() backup.Progress {

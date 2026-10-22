@@ -96,11 +96,20 @@ func matchesPattern(pattern, rel string) bool {
 	}
 }
 
-// Progress is called periodically during long operations.
-type Progress func(files int, bytes int64)
+// profileEntry is a file or directory to include in a backup.
+type profileEntry struct {
+	rel  string // slash-separated path relative to the profile dir
+	info fs.FileInfo
+}
 
 // Create writes a backup of profileDir to archivePath.
 func Create(profileDir, profileName, zenVersion, archivePath string, opts Options, progress Progress) (Manifest, error) {
+	entries, err := scanProfile(profileDir, opts)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("scanning profile: %w", err)
+	}
+	files := lo.Filter(entries, func(e profileEntry, _ int) bool { return !e.info.IsDir() })
+
 	home, _ := os.UserHomeDir()
 	m := Manifest{
 		FormatVersion: FormatVersion,
@@ -112,116 +121,122 @@ func Create(profileDir, profileName, zenVersion, archivePath string, opts Option
 		ProfilePath:   profileDir,
 		ZenVersion:    zenVersion,
 		Slim:          opts.Slim,
+		Files:         len(files),
+		Bytes:         lo.SumBy(files, func(e profileEntry) int64 { return e.info.Size() }),
 	}
 
-	type entry struct {
-		rel  string
-		info fs.FileInfo
-	}
-	var entries []entry
+	err = writeFileAtomically(archivePath, func(w io.Writer) error {
+		return writeArchive(w, profileDir, m, entries, progress)
+	})
+	return m, err
+}
+
+// scanProfile lists the regular files and directories to back up.
+func scanProfile(profileDir string, opts Options) ([]profileEntry, error) {
+	var entries []profileEntry
 	err := filepath.WalkDir(profileDir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
+		if err != nil || p == profileDir {
 			return err
-		}
-		if p == profileDir {
-			return nil
 		}
 		rel, err := filepath.Rel(profileDir, p)
 		if err != nil {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		if Excluded(rel, opts) {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
+		excluded := Excluded(rel, opts)
+		switch {
+		case excluded && d.IsDir():
+			return filepath.SkipDir
+		case excluded:
 			return nil
-		}
-		if !d.Type().IsRegular() && !d.IsDir() {
+		case !d.IsDir() && !d.Type().IsRegular():
 			return nil // symlinks, sockets, etc.
 		}
 		info, err := d.Info()
 		if err != nil {
 			return err
 		}
-		entries = append(entries, entry{rel, info})
-		if !d.IsDir() {
-			m.Files++
-			m.Bytes += info.Size()
-		}
+		entries = append(entries, profileEntry{rel, info})
 		return nil
 	})
-	if err != nil {
-		return m, fmt.Errorf("scanning profile: %w", err)
-	}
+	return entries, err
+}
 
-	if err := os.MkdirAll(filepath.Dir(archivePath), 0o755); err != nil {
-		return m, err
+// writeFileAtomically writes to a temporary file next to path and renames it
+// into place only if write succeeds, so a failure never leaves a partial file.
+func writeFileAtomically(path string, write func(io.Writer) error) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(archivePath), ".zen-backup-*.partial")
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".zen-backup-*.partial")
 	if err != nil {
-		return m, err
+		return err
 	}
 	defer func() { _ = os.Remove(tmp.Name()) }()
 
-	gz := gzip.NewWriter(tmp)
-	tw := tar.NewWriter(gz)
-
-	manifestJSON, _ := json.MarshalIndent(m, "", "  ")
-	if err := tw.WriteHeader(&tar.Header{
-		Name: ManifestName, Mode: 0o644, Size: int64(len(manifestJSON)),
-		ModTime: m.CreatedAt, Typeflag: tar.TypeReg,
-	}); err != nil {
-		return m, err
-	}
-	if _, err := tw.Write(manifestJSON); err != nil {
-		return m, err
-	}
-
-	var doneFiles int
-	var doneBytes int64
-	lastReport := time.Now()
-	for _, e := range entries {
-		hdr, err := tar.FileInfoHeader(e.info, "")
-		if err != nil {
-			return m, err
-		}
-		hdr.Name = ProfilePrefix + e.rel
-		hdr.Uname, hdr.Gname, hdr.Uid, hdr.Gid = "", "", 0, 0
-		if e.info.IsDir() {
-			hdr.Name += "/"
-			if err := tw.WriteHeader(hdr); err != nil {
-				return m, err
-			}
-			continue
-		}
-		if err := tw.WriteHeader(hdr); err != nil {
-			return m, err
-		}
-		if err := copyFile(tw, filepath.Join(profileDir, filepath.FromSlash(e.rel)), hdr.Size); err != nil {
-			return m, fmt.Errorf("%s: %w", e.rel, err)
-		}
-		doneFiles++
-		doneBytes += hdr.Size
-		if progress != nil && time.Since(lastReport) > 200*time.Millisecond {
-			progress(doneFiles, doneBytes)
-			lastReport = time.Now()
-		}
-	}
-	if progress != nil {
-		progress(doneFiles, doneBytes)
-	}
-
-	if err := tw.Close(); err != nil {
-		return m, err
-	}
-	if err := gz.Close(); err != nil {
-		return m, err
+	if err := write(tmp); err != nil {
+		_ = tmp.Close()
+		return err
 	}
 	if err := tmp.Close(); err != nil {
-		return m, err
+		return err
 	}
-	return m, os.Rename(tmp.Name(), archivePath)
+	return os.Rename(tmp.Name(), path)
+}
+
+// writeArchive writes a gzipped tar with the manifest followed by the profile.
+func writeArchive(w io.Writer, profileDir string, m Manifest, entries []profileEntry, progress Progress) error {
+	gz := gzip.NewWriter(w)
+	tw := tar.NewWriter(gz)
+
+	if err := writeManifest(tw, m); err != nil {
+		return err
+	}
+	tracker := progressTracker{report: progress}
+	for _, e := range entries {
+		if err := writeEntry(tw, profileDir, e); err != nil {
+			return fmt.Errorf("%s: %w", e.rel, err)
+		}
+		if !e.info.IsDir() {
+			tracker.add(e.info.Size())
+		}
+	}
+	tracker.flush()
+
+	if err := tw.Close(); err != nil {
+		return err
+	}
+	return gz.Close()
+}
+
+func writeManifest(tw *tar.Writer, m Manifest) error {
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	hdr := &tar.Header{Name: ManifestName, Mode: 0o644, Size: int64(len(data)), ModTime: m.CreatedAt, Typeflag: tar.TypeReg}
+	if err := tw.WriteHeader(hdr); err != nil {
+		return err
+	}
+	_, err = tw.Write(data)
+	return err
+}
+
+func writeEntry(tw *tar.Writer, profileDir string, e profileEntry) error {
+	hdr, err := tar.FileInfoHeader(e.info, "")
+	if err != nil {
+		return err
+	}
+	hdr.Name = ProfilePrefix + e.rel
+	hdr.Uname, hdr.Gname, hdr.Uid, hdr.Gid = "", "", 0, 0
+	if e.info.IsDir() {
+		hdr.Name += "/"
+		return tw.WriteHeader(hdr)
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		return err
+	}
+	return copyFile(tw, filepath.Join(profileDir, filepath.FromSlash(e.rel)), hdr.Size)
 }
 
 // copyFile writes exactly size bytes of src, tolerating files that changed

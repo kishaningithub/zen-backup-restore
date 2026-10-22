@@ -8,12 +8,15 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestExcluded(t *testing.T) {
 	cases := []struct {
-		rel        string
-		full, slim bool
+		rel            string
+		excludedByFull bool
+		excludedBySlim bool
 	}{
 		{"places.sqlite", false, false},
 		{"places.sqlite-wal", false, false},
@@ -32,12 +35,10 @@ func TestExcluded(t *testing.T) {
 		{"chrome/userChrome.css", false, false},
 	}
 	for _, c := range cases {
-		if got := Excluded(c.rel, Options{}); got != c.full {
-			t.Errorf("Excluded(%q, full) = %v, want %v", c.rel, got, c.full)
-		}
-		if got := Excluded(c.rel, Options{Slim: true}); got != c.slim {
-			t.Errorf("Excluded(%q, slim) = %v, want %v", c.rel, got, c.slim)
-		}
+		t.Run(c.rel, func(t *testing.T) {
+			require.Equal(t, c.excludedByFull, Excluded(c.rel, Options{}), "full backup")
+			require.Equal(t, c.excludedBySlim, Excluded(c.rel, Options{Slim: true}), "slim backup")
+		})
 	}
 }
 
@@ -48,28 +49,27 @@ func TestPathRewriterFromWindows(t *testing.T) {
 	m := Manifest{OS: "windows", HomeDir: `C:\Users\old`, ProfilePath: `C:\Users\old\AppData\Roaming\zen\Profiles\ab.Default (release)`}
 	r := newPathRewriter(m, "/home/new/.zen/xy.Restored", "/home/new")
 
-	got, ok := r.value(`C:\Users\old\AppData\Roaming\zen\Profiles\ab.Default (release)\extensions\a@b.xpi`)
-	if !ok || got != "/home/new/.zen/xy.Restored/extensions/a@b.xpi" {
-		t.Errorf("profile path: %q %v", got, ok)
+	cases := map[string]string{
+		`C:\Users\old\AppData\Roaming\zen\Profiles\ab.Default (release)\extensions\a@b.xpi`: "/home/new/.zen/xy.Restored/extensions/a@b.xpi",
+		`C:\Users\old\Downloads`: "/home/new/Downloads",
+		"jar:file:///C:/Users/old/AppData/Roaming/zen/Profiles/ab.Default%20(release)/extensions/%7Bid%7D.xpi!/": "jar:file:///home/new/.zen/xy.Restored/extensions/%7Bid%7D.xpi!/",
 	}
-	got, ok = r.value(`C:\Users\old\Downloads`)
-	if !ok || got != "/home/new/Downloads" {
-		t.Errorf("home path: %q %v", got, ok)
+	for from, want := range cases {
+		got, ok := r.value(from)
+		require.True(t, ok, from)
+		require.Equal(t, want, got)
 	}
-	got, ok = r.value("jar:file:///C:/Users/old/AppData/Roaming/zen/Profiles/ab.Default%20(release)/extensions/%7Bid%7D.xpi!/")
-	if !ok || got != "jar:file:///home/new/.zen/xy.Restored/extensions/%7Bid%7D.xpi!/" {
-		t.Errorf("jar url: %q %v", got, ok)
-	}
-	if _, ok := r.value("https://example.com"); ok {
-		t.Error("unrelated string rewritten")
-	}
+
+	_, ok := r.value("https://example.com")
+	require.False(t, ok, "unrelated strings must not be rewritten")
 }
 
 func TestRoundTripRewritesPaths(t *testing.T) {
 	tmp := t.TempDir()
+	home, err := os.UserHomeDir()
+	require.NoError(t, err)
 	src := filepath.Join(tmp, "src", "ab.Old Profile")
-	home, _ := os.UserHomeDir()
-	files := map[string]string{
+	writeFiles(t, src, map[string]string{
 		"places.sqlite":         "db",
 		"places.sqlite-wal":     "wal",
 		"places.sqlite-shm":     "shm",
@@ -77,82 +77,89 @@ func TestRoundTripRewritesPaths(t *testing.T) {
 		"compatibility.ini":     "[Compatibility]\nLastVersion=1.0b_1/1\n",
 		"cache2/entries/x":      "cache",
 		"chrome/userChrome.css": "a{}",
-		"prefs.js": `user_pref("browser.download.dir", "` + strings.ReplaceAll(filepath.Join(home, "Downloads"), `\`, `\\`) + `");` + "\n" +
-			`user_pref("some.path", "` + strings.ReplaceAll(filepath.Join(src, "x"), `\`, `\\`) + `");` + "\n",
-		"extensions.json": `{"addons":[{"path":` + quoteJSON(filepath.Join(src, "extensions", "a.xpi")) + `}]}`,
-	}
-	for name, body := range files {
-		p := filepath.Join(src, filepath.FromSlash(name))
-		os.MkdirAll(filepath.Dir(p), 0o755)
-		os.WriteFile(p, []byte(body), 0o644)
-	}
+		"prefs.js": `user_pref("browser.download.dir", ` + jsonString(filepath.Join(home, "Downloads")) + ");\n" +
+			`user_pref("some.path", ` + jsonString(filepath.Join(src, "x")) + ");\n",
+		"extensions.json": `{"addons":[{"path":` + jsonString(filepath.Join(src, "extensions", "a.xpi")) + `}]}`,
+	})
 
 	archive := filepath.Join(tmp, "b.tar.gz")
-	if _, err := Create(src, "Old", "1.0b", archive, Options{}, nil); err != nil {
-		t.Fatal(err)
-	}
+	_, err = Create(src, "Old", "1.0b", archive, Options{}, nil)
+	require.NoError(t, err)
+
 	dst := filepath.Join(tmp, "dst", "cd.New")
-	os.MkdirAll(dst, 0o755)
-	os.WriteFile(filepath.Join(dst, "stale"), []byte("x"), 0o644)
+	writeFiles(t, dst, map[string]string{"stale": "x"})
 
 	res, err := Restore(archive, dst, true, nil)
-	if err != nil {
-		t.Fatal(err)
+	require.NoError(t, err)
+
+	require.NotEmpty(t, res.PreviousDir, "previous profile should be kept")
+	require.FileExists(t, filepath.Join(res.PreviousDir, "stale"))
+	for _, kept := range []string{"places.sqlite", "places.sqlite-wal", "chrome/userChrome.css"} {
+		require.FileExists(t, filepath.Join(dst, kept))
 	}
-	if res.PreviousDir == "" {
-		t.Fatal("expected previous profile to be kept")
+	for _, dropped := range []string{"places.sqlite-shm", ".parentlock", "compatibility.ini", "cache2", "stale"} {
+		require.NoFileExists(t, filepath.Join(dst, dropped))
+		require.NoDirExists(t, filepath.Join(dst, dropped))
 	}
-	if _, err := os.Stat(filepath.Join(res.PreviousDir, "stale")); err != nil {
-		t.Error("previous profile not preserved")
-	}
-	for _, want := range []string{"places.sqlite", "places.sqlite-wal", "chrome/userChrome.css"} {
-		if _, err := os.Stat(filepath.Join(dst, filepath.FromSlash(want))); err != nil {
-			t.Errorf("missing %s", want)
-		}
-	}
-	for _, gone := range []string{"places.sqlite-shm", ".parentlock", "compatibility.ini", "cache2", "stale"} {
-		if _, err := os.Stat(filepath.Join(dst, gone)); err == nil {
-			t.Errorf("%s should not be restored", gone)
-		}
-	}
-	ext, _ := os.ReadFile(filepath.Join(dst, "extensions.json"))
-	if !strings.Contains(string(ext), quoteJSON(filepath.Join(dst, "extensions", "a.xpi"))) {
-		t.Errorf("extensions.json not rewritten: %s", ext)
-	}
-	prefs, _ := os.ReadFile(filepath.Join(dst, "prefs.js"))
-	if strings.Contains(string(prefs), "Old Profile") || strings.Contains(string(prefs), ".restoring-") {
-		t.Errorf("prefs.js not rewritten: %s", prefs)
-	}
+
+	extensions, err := os.ReadFile(filepath.Join(dst, "extensions.json"))
+	require.NoError(t, err)
+	require.Contains(t, string(extensions), jsonString(filepath.Join(dst, "extensions", "a.xpi")))
+
+	prefs, err := os.ReadFile(filepath.Join(dst, "prefs.js"))
+	require.NoError(t, err)
+	require.NotContains(t, string(prefs), "Old Profile")
+	require.NotContains(t, string(prefs), ".restoring-")
 }
 
 func TestRestoreRejectsPathTraversal(t *testing.T) {
 	tmp := t.TempDir()
 	archive := filepath.Join(tmp, "evil.tar.gz")
-	f, _ := os.Create(archive)
-	gz := gzip.NewWriter(f)
-	tw := tar.NewWriter(gz)
-	write := func(name, body string) {
-		tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(body)), Typeflag: tar.TypeReg})
-		tw.Write([]byte(body))
-	}
-	write(ManifestName, `{"format_version":1}`)
-	write("profile/../../escaped", "x")
-	tw.Close()
-	gz.Close()
-	f.Close()
+	writeTarGz(t, archive, map[string]string{
+		ManifestName:            `{"format_version":1}`,
+		"profile/../../escaped": "x",
+	})
 
 	dst := filepath.Join(tmp, "a", "profile")
-	if _, err := Restore(archive, dst, false, nil); err == nil || !strings.Contains(err.Error(), "unsafe path") {
-		t.Fatalf("expected unsafe path error, got %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(tmp, "escaped")); err == nil {
-		t.Fatal("file escaped the target directory")
-	}
-	if _, err := os.Stat(dst); err == nil {
-		t.Fatal("target should not exist after a failed restore")
+	_, err := Restore(archive, dst, false, nil)
+
+	require.ErrorContains(t, err, "unsafe path")
+	require.NoFileExists(t, filepath.Join(tmp, "escaped"))
+	require.NoDirExists(t, dst, "a failed restore must not create the target")
+}
+
+func writeFiles(t *testing.T, dir string, files map[string]string) {
+	t.Helper()
+	for name, content := range files {
+		path := filepath.Join(dir, filepath.FromSlash(name))
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
 	}
 }
 
-func quoteJSON(s string) string {
+// writeTarGz writes entries in a fixed order: the manifest first, then the rest.
+func writeTarGz(t *testing.T, path string, entries map[string]string) {
+	t.Helper()
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	gz := gzip.NewWriter(f)
+	tw := tar.NewWriter(gz)
+	write := func(name, content string) {
+		require.NoError(t, tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(content)), Typeflag: tar.TypeReg}))
+		_, err := tw.Write([]byte(content))
+		require.NoError(t, err)
+	}
+	write(ManifestName, entries[ManifestName])
+	for name, content := range entries {
+		if name != ManifestName {
+			write(name, content)
+		}
+	}
+	require.NoError(t, tw.Close())
+	require.NoError(t, gz.Close())
+	require.NoError(t, f.Close())
+}
+
+func jsonString(s string) string {
 	return `"` + strings.ReplaceAll(s, `\`, `\\`) + `"`
 }
