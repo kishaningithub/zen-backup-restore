@@ -71,6 +71,7 @@ zen-backup-restore                     # interactive menu
 zen-backup-restore list                # profiles + existing backups
 zen-backup-restore backup              # back up the default profile
 zen-backup-restore backup -p "Default (release)" --slim -o ~/Dropbox/zen
+zen-backup-restore backup --exclude-sensitive   # no passwords, cookies or site data
 zen-backup-restore restore             # pick a backup and a target interactively
 zen-backup-restore restore backup.tar.gz --new "Restored"   # restore into a new profile
 zen-backup-restore restore backup.tar.gz -p "Default (release)" -y   # overwrite a profile
@@ -95,7 +96,35 @@ The whole profile, including bookmarks, history, passwords (`key4.db` + `logins.
 
 SQLite `-wal` files **are** included, so recent history isn't lost.
 
-`--slim` also skips website storage (`storage/default/http*`: site IndexedDB, caches and similar) and rolling session snapshots. That's often >1 GB. Extension storage is still kept.
+`--slim` makes a much smaller backup (often >1 GB smaller) by also skipping data that sites can re-download and old session snapshots:
+
+- website storage (`storage/default/http*`): each site's IndexedDB, localStorage and offline caches
+- Zen's rolling session snapshots (`zen-sessions-backup/`)
+- Firefox's previous-session and per-update session snapshots (`sessionstore-backups/previous.jsonlz4`, `sessionstore-backups/upgrade.jsonlz4-*`)
+
+Still kept:
+
+- bookmarks, history, passwords and cookies, so you stay logged in to most sites
+- extensions and their storage
+- prefs and `chrome/` customisations
+- the current session (`zen-sessions.jsonlz4`, `sessionstore-backups/recovery.jsonlz4`), so your spaces, pinned tabs and open tabs come back
+
+Sites that keep data locally, such as offline web apps or some chat and mail clients, may need to re-sync and can lose local-only state.
+
+`--exclude-sensitive` makes a backup that's safer to share or store somewhere untrusted. It skips:
+
+- saved passwords and the keys that decrypt them (`logins.json`, `key4.db`)
+- cookies (`cookies.sqlite`)
+- saved form and search entries (`formhistory.sqlite`)
+- saved addresses and cards (`autofill-profiles.json`)
+- Firefox account tokens (`signedInUser.json`)
+- website storage (localStorage/IndexedDB, which often hold login tokens)
+
+You'll need to log in to sites again after restoring. Some sensitive data is still included:
+
+- history and bookmarks
+- open tabs and session files, which can contain session cookies and typed form text
+- extension storage, which includes password-manager extension vaults
 
 ## What a restore does
 

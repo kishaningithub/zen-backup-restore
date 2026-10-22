@@ -14,30 +14,42 @@ import (
 
 func TestExcluded(t *testing.T) {
 	cases := []struct {
-		rel            string
-		excludedByFull bool
-		excludedBySlim bool
+		rel                   string
+		excludedByFull        bool
+		excludedBySlim        bool
+		excludedByNoSensitive bool
 	}{
-		{"places.sqlite", false, false},
-		{"places.sqlite-wal", false, false},
-		{"places.sqlite-shm", true, true},
-		{"storage/default/moz-extension+++abc/idb/x.sqlite-shm", true, true},
-		{".parentlock", true, true},
-		{"compatibility.ini", true, true},
-		{"cache2/entries/x", true, true},
-		{"gmp-widevinecdm/4.10/lib.dylib", true, true},
-		{"storage/temporary/x", true, true},
-		{"storage/default/https+++x.com^userContextId=6/ls/data.sqlite", false, true},
-		{"storage/default/moz-extension+++abc/idb/x.sqlite", false, false},
-		{"zen-sessions-backup/clean.jsonlz4", false, true},
-		{"sessionstore-backups/recovery.jsonlz4", false, false},
-		{"sessionstore-backups/upgrade.jsonlz4-20240101", false, true},
-		{"chrome/userChrome.css", false, false},
+		{"places.sqlite", false, false, false},
+		{"places.sqlite-wal", false, false, false},
+		{"places.sqlite-shm", true, true, true},
+		{"storage/default/moz-extension+++abc/idb/x.sqlite-shm", true, true, true},
+		{".parentlock", true, true, true},
+		{"compatibility.ini", true, true, true},
+		{"cache2/entries/x", true, true, true},
+		{"gmp-widevinecdm/4.10/lib.dylib", true, true, true},
+		{"storage/temporary/x", true, true, true},
+		{"storage/default/https+++x.com^userContextId=6/ls/data.sqlite", false, true, true},
+		{"storage/default/moz-extension+++abc/idb/x.sqlite", false, false, false},
+		{"zen-sessions-backup/clean.jsonlz4", false, true, false},
+		{"sessionstore-backups/recovery.jsonlz4", false, false, false},
+		{"sessionstore-backups/upgrade.jsonlz4-20240101", false, true, false},
+		{"chrome/userChrome.css", false, false, false},
+		{"logins.json", false, false, true},
+		{"logins-backup.json", false, false, true},
+		{"key4.db", false, false, true},
+		{"cookies.sqlite", false, false, true},
+		{"cookies.sqlite-wal", false, false, true},
+		{"formhistory.sqlite", false, false, true},
+		{"autofill-profiles.json", false, false, true},
+		{"signedInUser.json", false, false, true},
+		{"webappsstore.sqlite", false, false, true},
+		{"cert9.db", false, false, false},
 	}
 	for _, c := range cases {
 		t.Run(c.rel, func(t *testing.T) {
 			require.Equal(t, c.excludedByFull, Excluded(c.rel, Options{}), "full backup")
 			require.Equal(t, c.excludedBySlim, Excluded(c.rel, Options{Slim: true}), "slim backup")
+			require.Equal(t, c.excludedByNoSensitive, Excluded(c.rel, Options{ExcludeSensitive: true}), "exclude-sensitive backup")
 		})
 	}
 }

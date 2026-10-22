@@ -36,14 +36,19 @@ type Manifest struct {
 	ProfilePath   string    `json:"profile_path"`
 	ZenVersion    string    `json:"zen_version,omitempty"`
 	Slim          bool      `json:"slim"`
-	Files         int       `json:"files"`
-	Bytes         int64     `json:"bytes"`
+	// ExcludeSensitive records that secrets were left out of the archive.
+	ExcludeSensitive bool  `json:"exclude_sensitive,omitempty"`
+	Files            int   `json:"files"`
+	Bytes            int64 `json:"bytes"`
 }
 
 // Options control what goes into a backup.
 type Options struct {
 	// Slim skips website storage and rolling session snapshots.
 	Slim bool
+	// ExcludeSensitive skips passwords, cookies, form/autofill data,
+	// account tokens and website storage.
+	ExcludeSensitive bool
 }
 
 // Paths that are caches, locks, telemetry or machine-specific binaries.
@@ -66,17 +71,30 @@ var slimExcluded = []string{
 	"sessionstore-backups/previous.jsonlz4",
 }
 
+// Files holding secrets. Patterns ending in * also cover SQLite -wal and
+// -journal siblings.
+var sensitiveExcluded = []string{
+	"logins*.json", "signons.sqlite*", // saved passwords
+	"key4.db*", "key3.db*", // keys that decrypt passwords and cards
+	"cookies.sqlite*",
+	"formhistory.sqlite*",    // typed form and search entries
+	"autofill-profiles.json", // saved addresses and cards
+	"signedInUser.json",      // Firefox account tokens
+	"credentialstate.sqlite*",
+	"webappsstore.sqlite*", "storage/ls-archive.sqlite*", // legacy site localStorage
+}
+
 // Website data lives in storage/default/<scheme>+++<host>; extension data
-// (moz-extension+++…) is kept even in slim mode.
+// (moz-extension+++…) is kept even in slim or sensitive-excluded mode.
 var websiteStorage = regexp.MustCompile(`^storage/default/https?\+\+\+[^/]*(/|$)`)
 
 // Excluded reports whether a profile-relative, slash-separated path is skipped.
 func Excluded(rel string, opts Options) bool {
 	matches := func(pattern string) bool { return matchesPattern(pattern, rel) }
-	if lo.SomeBy(alwaysExcluded, matches) {
-		return true
-	}
-	return opts.Slim && (websiteStorage.MatchString(rel) || lo.SomeBy(slimExcluded, matches))
+	isWebsiteStorage := websiteStorage.MatchString(rel)
+	return lo.SomeBy(alwaysExcluded, matches) ||
+		opts.Slim && (isWebsiteStorage || lo.SomeBy(slimExcluded, matches)) ||
+		opts.ExcludeSensitive && (isWebsiteStorage || lo.SomeBy(sensitiveExcluded, matches))
 }
 
 func matchesPattern(pattern, rel string) bool {
@@ -112,17 +130,18 @@ func Create(profileDir, profileName, zenVersion, archivePath string, opts Option
 
 	home, _ := os.UserHomeDir()
 	m := Manifest{
-		FormatVersion: FormatVersion,
-		CreatedAt:     time.Now().UTC().Truncate(time.Second),
-		OS:            runtime.GOOS,
-		Arch:          runtime.GOARCH,
-		HomeDir:       home,
-		ProfileName:   profileName,
-		ProfilePath:   profileDir,
-		ZenVersion:    zenVersion,
-		Slim:          opts.Slim,
-		Files:         len(files),
-		Bytes:         lo.SumBy(files, func(e profileEntry) int64 { return e.info.Size() }),
+		FormatVersion:    FormatVersion,
+		CreatedAt:        time.Now().UTC().Truncate(time.Second),
+		OS:               runtime.GOOS,
+		Arch:             runtime.GOARCH,
+		HomeDir:          home,
+		ProfileName:      profileName,
+		ProfilePath:      profileDir,
+		ZenVersion:       zenVersion,
+		Slim:             opts.Slim,
+		ExcludeSensitive: opts.ExcludeSensitive,
+		Files:            len(files),
+		Bytes:            lo.SumBy(files, func(e profileEntry) int64 { return e.info.Size() }),
 	}
 
 	err = writeFileAtomically(archivePath, func(w io.Writer) error {

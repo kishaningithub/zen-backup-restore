@@ -39,15 +39,16 @@ func main() {
 }
 
 type config struct {
-	zenDir    string
-	backupDir string
-	profile   string
-	output    string
-	newName   string
-	slim      bool
-	force     bool
-	noKeepOld bool
-	yes       bool
+	zenDir           string
+	backupDir        string
+	profile          string
+	output           string
+	newName          string
+	slim             bool
+	excludeSensitive bool
+	force            bool
+	noKeepOld        bool
+	yes              bool
 }
 
 func newRootCmd() *cobra.Command {
@@ -102,7 +103,8 @@ Run without a command for an interactive menu.`,
 		Use:   "backup",
 		Short: "Back up a profile",
 		Example: `  zen-backup-restore backup
-  zen-backup-restore backup -p "Default (release)" --slim -o ~/Dropbox/zen`,
+  zen-backup-restore backup -p "Default (release)" --slim -o ~/Dropbox/zen
+  zen-backup-restore backup --exclude-sensitive -o ~/shared/zen`,
 		Args: cobra.NoArgs,
 		RunE: func(*cobra.Command, []string) error { return cmdBackup(c, newUI()) },
 	}
@@ -110,6 +112,7 @@ Run without a command for an interactive menu.`,
 	bf.StringVarP(&c.profile, "profile", "p", "", "profile name or path to back up (default: Zen's default profile)")
 	bf.StringVarP(&c.output, "output", "o", "", "backup directory or .tar.gz path (default: --backup-dir)")
 	bf.BoolVar(&c.slim, "slim", false, "skip website storage and old session snapshots")
+	bf.BoolVar(&c.excludeSensitive, "exclude-sensitive", false, "skip passwords, cookies, form/autofill data, account tokens and website storage")
 	bf.BoolVar(&c.force, "force", false, "back up even if Zen is running (may be inconsistent)")
 
 	restoreCmd := &cobra.Command{
@@ -237,7 +240,7 @@ func cmdBackup(c config, ui *ui) error {
 
 	out := archivePath(c, p.Name)
 	fmt.Printf("Backing up %q\n  from %s\n  to   %s\n", p.Name, p.Path, out)
-	m, err := backup.Create(p.Path, p.Name, zen.Version(p.Path), out, backup.Options{Slim: c.slim}, progressPrinter())
+	m, err := backup.Create(p.Path, p.Name, zen.Version(p.Path), out, backup.Options{Slim: c.slim, ExcludeSensitive: c.excludeSensitive}, progressPrinter())
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
 		return err
@@ -296,6 +299,7 @@ func backupLabel(b backupInfo) string {
 		m.CreatedAt.Local().Format("2006-01-02 15:04"),
 		lo.Ternary(m.ZenVersion != "", "Zen "+m.ZenVersion, ""),
 		lo.Ternary(m.Slim, "slim", ""),
+		lo.Ternary(m.ExcludeSensitive, "no sensitive data", ""),
 		humanBytes(m.Bytes),
 	})
 	return name + "\n      " + strings.Join(details, ", ")
@@ -320,6 +324,9 @@ func cmdRestore(c config, ui *ui, archive string) error {
 	target, newName, err := chooseRestoreTarget(c, ui, profiles, m.ProfileName+" restored")
 	if err != nil {
 		return err
+	}
+	if m.ExcludeSensitive {
+		fmt.Println("Note: this backup has no passwords, cookies or website data; you'll need to log in to sites again.")
 	}
 	if newName != "" {
 		return restoreIntoNewProfile(root, profiles, archive, newName)
