@@ -3,17 +3,16 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/huh"
 	"github.com/kishaningithub/zen-backup-restore/internal/backup"
 	"github.com/kishaningithub/zen-backup-restore/internal/zen"
 	"github.com/samber/lo"
@@ -69,15 +68,18 @@ Run without a command for an interactive menu.`,
 			if !ui.tty {
 				return cmd.Help()
 			}
-			fmt.Println("Zen Backup & Restore")
-			choice, err := ui.choose("What do you want to do?", []string{"Back up a profile", "Restore a backup", "List profiles and backups"}, 0)
+			action, err := choose("Zen Backup & Restore — what do you want to do?",
+				huh.NewOption("Back up a profile", "backup"),
+				huh.NewOption("Restore a backup", "restore"),
+				huh.NewOption("List profiles and backups", "list"),
+			)
 			if err != nil {
 				return err
 			}
-			switch choice {
-			case 0:
+			switch action {
+			case "backup":
 				return cmdBackup(c, ui)
-			case 1:
+			case "restore":
 				return cmdRestore(c, ui, "")
 			default:
 				return cmdList(c)
@@ -188,11 +190,9 @@ func pickProfile(ui *ui, profiles []zen.Profile, query, prompt string) (zen.Prof
 	if len(profiles) == 1 || !ui.tty {
 		return profiles[0], nil // sorted with the default first
 	}
-	i, err := ui.choose(prompt, lo.Map(profiles, func(p zen.Profile, _ int) string { return profileLabel(p) }), 0)
-	if err != nil {
-		return zen.Profile{}, err
-	}
-	return profiles[i], nil
+	return choose(prompt, lo.Map(profiles, func(p zen.Profile, _ int) huh.Option[zen.Profile] {
+		return huh.NewOption(profileLabel(p), p)
+	})...)
 }
 
 func cmdList(c config) error {
@@ -335,12 +335,9 @@ func chooseArchive(c config, ui *ui) (string, error) {
 	if !ui.tty {
 		return "", errors.New("specify the archive to restore")
 	}
-	labels := lo.Map(backups, func(b backupInfo, _ int) string { return backupLabel(b) })
-	i, err := ui.choose("Which backup do you want to restore?", labels, 0)
-	if err != nil {
-		return "", err
-	}
-	return backups[i].path, nil
+	return choose("Which backup do you want to restore?", lo.Map(backups, func(b backupInfo, _ int) huh.Option[string] {
+		return huh.NewOption(backupLabel(b), b.path)
+	})...)
 }
 
 // chooseRestoreTarget returns either an existing profile to overwrite or the
@@ -356,17 +353,20 @@ func chooseRestoreTarget(c config, ui *ui, profiles []zen.Profile, defaultNewNam
 		return zen.Profile{}, "", errors.New("specify --profile to overwrite or --new to create a profile")
 	}
 
-	labels := append([]string{"Create a new profile (safest)"},
-		lo.Map(profiles, func(p zen.Profile, _ int) string { return "Overwrite " + profileLabel(p) })...)
-	i, err := ui.choose("Restore into:", labels, 0)
+	// A nil choice means "create a new profile".
+	overwriteOptions := lo.Map(profiles, func(p zen.Profile, i int) huh.Option[*zen.Profile] {
+		return huh.NewOption("Overwrite "+profileLabel(p), &profiles[i])
+	})
+	target, err := choose("Restore into:",
+		append([]huh.Option[*zen.Profile]{huh.NewOption[*zen.Profile]("Create a new profile (safest)", nil)}, overwriteOptions...)...)
 	if err != nil {
 		return zen.Profile{}, "", err
 	}
-	if i > 0 {
-		return profiles[i-1], "", nil
+	if target != nil {
+		return *target, "", nil
 	}
-	name, err := ui.ask(fmt.Sprintf("Name for the new profile [%s]: ", defaultNewName))
-	return zen.Profile{}, lo.Ternary(name != "", name, defaultNewName), err
+	name, err := ask("Name for the new profile", defaultNewName)
+	return zen.Profile{}, name, err
 }
 
 func restoreIntoNewProfile(root string, profiles []zen.Profile, archive, name string) error {
@@ -427,7 +427,7 @@ func confirmOverwrite(c config, ui *ui) error {
 	if !ui.tty {
 		return errors.New("refusing to overwrite without confirmation; pass --yes")
 	}
-	ok, err := ui.confirm("Continue?")
+	ok, err := confirm("Continue?")
 	if err != nil {
 		return err
 	}
@@ -464,51 +464,4 @@ func humanBytes(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
-}
-
-type ui struct {
-	in  *bufio.Reader
-	tty bool
-}
-
-func newUI() *ui {
-	return &ui{in: bufio.NewReader(os.Stdin), tty: term.IsTerminal(int(os.Stdin.Fd()))}
-}
-
-func (u *ui) ask(prompt string) (string, error) {
-	fmt.Print(prompt)
-	line, err := u.in.ReadString('\n')
-	if err != nil && line == "" {
-		fmt.Println()
-		return "", err
-	}
-	return strings.TrimSpace(line), nil
-}
-
-func (u *ui) choose(prompt string, options []string, def int) (int, error) {
-	fmt.Println(prompt)
-	for i, o := range options {
-		fmt.Printf("  [%d] %s\n", i+1, o)
-	}
-	for {
-		ans, err := u.ask(fmt.Sprintf("Choice [%d]: ", def+1))
-		if err != nil {
-			return 0, err
-		}
-		if ans == "" {
-			return def, nil
-		}
-		if n, err := strconv.Atoi(ans); err == nil && n >= 1 && n <= len(options) {
-			return n - 1, nil
-		}
-		fmt.Println("Invalid choice.")
-	}
-}
-
-func (u *ui) confirm(prompt string) (bool, error) {
-	ans, err := u.ask(prompt + " [y/N]: ")
-	if err != nil {
-		return false, err
-	}
-	return strings.EqualFold(ans, "y") || strings.EqualFold(ans, "yes"), nil
 }
