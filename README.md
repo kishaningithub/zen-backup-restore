@@ -1,0 +1,119 @@
+# zen-backup-restore
+
+[![Build Status](https://github.com/kishaningithub/zen-backup-restore/actions/workflows/build.yml/badge.svg)](https://github.com/kishaningithub/zen-backup-restore/actions/workflows/build.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/kishaningithub/zen-backup-restore)](https://goreportcard.com/report/github.com/kishaningithub/zen-backup-restore)
+[![Latest release](https://img.shields.io/github/release/kishaningithub/zen-backup-restore.svg)](https://github.com/kishaningithub/zen-backup-restore/releases)
+
+Back up and restore [Zen Browser](https://zen-browser.app/) profiles to local `.tar.gz` archives, with no account and no cloud sync. It's a single Go binary for macOS, Linux and Windows, inspired by [Zen-Backup-Tool](https://github.com/Ronin-CK/Zen-Backup-Tool).
+
+## Installation
+
+### Using Homebrew (Mac and Linux)
+
+```bash
+brew trust kishaningithub/tap
+brew install --cask kishaningithub/tap/zen-backup-restore
+```
+
+### Using Scoop (Windows)
+
+```powershell
+scoop bucket add kishaningithub https://github.com/kishaningithub/scoop-bucket
+scoop install kishaningithub/zen-backup-restore
+```
+
+### Using pkgx
+
+```bash
+pkgx zen-backup-restore@latest list
+```
+
+or if you prefer the env style which only adds zen-backup-restore to your current shell session
+
+```bash
+env +zen-backup-restore@latest
+
+zen-backup-restore list
+```
+
+### Using docker
+
+Backups record absolute profile paths, so the container must see your home directory at the **same path** as the host:
+
+```bash
+alias zen-backup-restore='docker run --rm -it --user "$(id -u):$(id -g)" -e HOME="$HOME" -v "$HOME:$HOME" ghcr.io/kishaningithub/zen-backup-restore:latest'
+
+zen-backup-restore list
+```
+
+On Linux, Zen's data dir is auto-detected. On macOS, pass it explicitly, since the container runs Linux:
+
+```bash
+zen-backup-restore backup --zen-dir "$HOME/Library/Application Support/zen"
+```
+
+> The "Zen is running" check may not work across the Docker VM on macOS, so make sure Zen is closed.
+
+### Using go
+
+```bash
+go install github.com/kishaningithub/zen-backup-restore@latest
+```
+
+### Others
+
+Head over to the [releases page](https://github.com/kishaningithub/zen-backup-restore/releases) and download a binary (or a `.deb`, `.rpm` or `.apk` package) for your platform.
+
+## Usage
+
+```sh
+zen-backup-restore                     # interactive menu
+zen-backup-restore list                # profiles + existing backups
+zen-backup-restore backup              # back up the default profile
+zen-backup-restore backup -p "Default (release)" --slim -o ~/Dropbox/zen
+zen-backup-restore restore             # pick a backup and a target interactively
+zen-backup-restore restore backup.tar.gz --new "Restored"   # restore into a new profile
+zen-backup-restore restore backup.tar.gz -p "Default (release)" -y   # overwrite a profile
+```
+
+Run `zen-backup-restore --help` (or `<command> --help`) for all flags. Shell completion scripts are available via `zen-backup-restore completion bash|zsh|fish|powershell`.
+
+Backups go to `~/Backups/ZenBrowser` by default. Change this with `--backup-dir` or `ZEN_BACKUP_DIR`.
+Zen's data dir is auto-detected (including Flatpak and Snap on Linux). Override it with `--zen-dir`.
+
+**Quit Zen before backing up or restoring.** The tool checks Zen's profile lock and refuses to run while the profile is in use.
+
+## What's backed up
+
+The whole profile, including bookmarks, history, passwords (`key4.db` + `logins.json`), cookies, extensions and their data, workspaces, sessions, pinned tabs, containers, keyboard shortcuts, Zen mods/themes, `chrome/` and prefs. Only things Zen regenerates are excluded:
+
+- caches (`cache2`, `startupCache`, …)
+- lock files
+- crash reports and telemetry
+- downloaded DRM/codec plugins (`gmp-*`)
+- SQLite `-shm` files
+
+SQLite `-wal` files **are** included, so recent history isn't lost.
+
+`--slim` also skips website storage (`storage/default/http*`: site IndexedDB, caches and similar) and rolling session snapshots. That's often >1 GB. Extension storage is still kept.
+
+## What a restore does
+
+1. Extracts the profile to a staging directory next to the target, so a failed restore leaves nothing half-written.
+2. Rewrites absolute paths in `prefs.js` and `*.json` (e.g. extension paths in `extensions.json`) to the new profile location and home directory. This also works across machines, usernames and operating systems.
+3. Drops `compatibility.ini` and `addonStartup.json.lz4`, so Zen rebuilds its caches for the new location.
+4. When overwriting, moves the old profile to `<profile>.pre-restore-<timestamp>`. Disable this with `--no-keep-old`.
+5. With `--new`, creates the profile directory and registers it in `profiles.ini`.
+
+Each archive contains a `manifest.json` (source OS, paths, Zen version, size) plus `profile/`.
+
+## Releasing
+
+Releases are built by [GoReleaser](https://goreleaser.com) (`.goreleaser.yml`) when a tag is pushed:
+
+1. Run the **Create tag** workflow (or `git tag vX.Y.Z && git push --tags`).
+2. The **Release** workflow runs `make release`. This publishes the GitHub release, the deb/rpm/apk packages, the Homebrew cask (`kishaningithub/homebrew-tap`), the Scoop manifest (`kishaningithub/scoop-bucket`) and multi-arch images to `ghcr.io/kishaningithub/zen-backup-restore`.
+
+The `GA_GORELEASER_TOKEN` secret must be a token with write access to this repo, the tap and the bucket. pkgx builds from source via its [pantry](https://github.com/pkgxdev/pantry), which picks up new GitHub releases automatically once the package is listed there.
+
+Run `make build` locally to tidy, compile, test, lint and validate the GoReleaser config.

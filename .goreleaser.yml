@@ -1,0 +1,72 @@
+version: 2
+
+project_name: zen-backup-restore
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - main: .
+    binary: zen-backup-restore
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.Version={{.Version}}
+    goos:
+      - windows
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    env:
+      - CGO_ENABLED=0
+
+homebrew_casks:
+  - repository:
+      owner: kishaningithub
+      name: homebrew-tap
+    homepage: https://github.com/kishaningithub/zen-backup-restore
+    description: Back up and restore Zen Browser profiles locally, without any online sync
+    license: MIT
+    # The binary is not signed and notarized, so remove the quarantine attribute to prevent Gatekeeper from blocking it
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/zen-backup-restore"]
+          end
+
+scoops:
+  - repository:
+      owner: kishaningithub
+      name: scoop-bucket
+    homepage: https://github.com/kishaningithub/zen-backup-restore
+    description: Back up and restore Zen Browser profiles locally, without any online sync
+    license: MIT
+
+nfpms:
+  - id: zen-backup-restore
+    package_name: zen-backup-restore
+    homepage: https://github.com/kishaningithub/zen-backup-restore
+    description: Back up and restore Zen Browser profiles locally, without any online sync
+    maintainer: Kishan B <kishancs46@gmail.com>
+    license: MIT
+    formats:
+      - apk
+      - deb
+      - rpm
+
+kos:
+  - base_image: alpine
+    repositories:
+      - ghcr.io/kishaningithub/zen-backup-restore
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    tags:
+      - '{{.Version}}'
+      - latest
+    bare: true
+    preserve_import_paths: false

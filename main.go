@@ -1,0 +1,488 @@
+// Command zen-backup-restore backs up and restores Zen Browser profiles to
+// local .tar.gz archives, no account or cloud sync required.
+package main
+
+import (
+	"bufio"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/kishaningithub/zen-backup-restore/internal/backup"
+	"github.com/kishaningithub/zen-backup-restore/internal/zen"
+	"github.com/samber/lo"
+	"github.com/spf13/cobra"
+	"golang.org/x/term"
+)
+
+// Version is set at build time by goreleaser.
+var Version = "dev"
+
+func defaultBackupDir() string {
+	if d := os.Getenv("ZEN_BACKUP_DIR"); d != "" {
+		return d
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, "Backups", "ZenBrowser")
+}
+
+func main() {
+	if err := newRootCmd().Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+}
+
+type config struct {
+	zenDir    string
+	backupDir string
+	profile   string
+	output    string
+	newName   string
+	slim      bool
+	force     bool
+	noKeepOld bool
+	yes       bool
+}
+
+func newRootCmd() *cobra.Command {
+	var c config
+	root := &cobra.Command{
+		Use:   "zen-backup-restore",
+		Short: "Back up and restore Zen Browser profiles locally",
+		Long: `Back up and restore Zen Browser profiles to local .tar.gz archives,
+no account or online sync required.
+
+Run without a command for an interactive menu.`,
+		Version:       Version,
+		Args:          cobra.NoArgs,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ui := newUI()
+			if !ui.tty {
+				return cmd.Help()
+			}
+			fmt.Println("Zen Backup & Restore")
+			choice, err := ui.choose("What do you want to do?", []string{"Back up a profile", "Restore a backup", "List profiles and backups"}, 0)
+			if err != nil {
+				return err
+			}
+			switch choice {
+			case 0:
+				return cmdBackup(c, ui)
+			case 1:
+				return cmdRestore(c, ui, "")
+			default:
+				return cmdList(c)
+			}
+		},
+	}
+	root.SetVersionTemplate("{{.Version}}\n")
+	pf := root.PersistentFlags()
+	pf.StringVar(&c.zenDir, "zen-dir", "", "Zen data dir containing profiles.ini (auto-detected)")
+	pf.StringVar(&c.backupDir, "backup-dir", defaultBackupDir(), "where backups are stored (env ZEN_BACKUP_DIR)")
+
+	listCmd := &cobra.Command{
+		Use:   "list",
+		Short: "Show profiles and existing backups",
+		Args:  cobra.NoArgs,
+		RunE:  func(*cobra.Command, []string) error { return cmdList(c) },
+	}
+
+	backupCmd := &cobra.Command{
+		Use:   "backup",
+		Short: "Back up a profile",
+		Example: `  zen-backup-restore backup
+  zen-backup-restore backup -p "Default (release)" --slim -o ~/Dropbox/zen`,
+		Args: cobra.NoArgs,
+		RunE: func(*cobra.Command, []string) error { return cmdBackup(c, newUI()) },
+	}
+	bf := backupCmd.Flags()
+	bf.StringVarP(&c.profile, "profile", "p", "", "profile name or path to back up (default: Zen's default profile)")
+	bf.StringVarP(&c.output, "output", "o", "", "backup directory or .tar.gz path (default: --backup-dir)")
+	bf.BoolVar(&c.slim, "slim", false, "skip website storage and old session snapshots")
+	bf.BoolVar(&c.force, "force", false, "back up even if Zen is running (may be inconsistent)")
+
+	restoreCmd := &cobra.Command{
+		Use:   "restore [archive]",
+		Short: "Restore a backup over a profile or into a new one",
+		Long: `Restore a backup over an existing profile (-p) or into a new profile (-n).
+Without an archive, pick one interactively from --backup-dir.`,
+		Example: `  zen-backup-restore restore
+  zen-backup-restore restore backup.tar.gz --new "Restored"
+  zen-backup-restore restore backup.tar.gz -p "Default (release)" -y`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			return cmdRestore(c, newUI(), lo.FirstOr(args, ""))
+		},
+	}
+	rf := restoreCmd.Flags()
+	rf.StringVarP(&c.profile, "profile", "p", "", "existing profile name or path to overwrite")
+	rf.StringVarP(&c.newName, "new", "n", "", "create and register a new profile with this name")
+	rf.BoolVar(&c.noKeepOld, "no-keep-old", false, "delete the overwritten profile instead of keeping a copy")
+	rf.BoolVarP(&c.yes, "yes", "y", false, "don't ask for confirmation")
+	restoreCmd.MarkFlagsMutuallyExclusive("profile", "new")
+
+	versionCmd := &cobra.Command{
+		Use:   "version",
+		Short: "Print the version",
+		Args:  cobra.NoArgs,
+		Run:   func(*cobra.Command, []string) { fmt.Println(Version) },
+	}
+
+	root.AddCommand(listCmd, backupCmd, restoreCmd, versionCmd)
+	return root
+}
+
+func zenRoot(c config) (string, error) {
+	if c.zenDir != "" {
+		return c.zenDir, nil
+	}
+	return zen.FindRoot()
+}
+
+func loadProfiles(c config) (string, []zen.Profile, error) {
+	root, err := zenRoot(c)
+	if err != nil {
+		return "", nil, err
+	}
+	profiles, err := zen.ListProfiles(root)
+	if err != nil {
+		return "", nil, fmt.Errorf("reading profiles.ini: %w", err)
+	}
+	return root, profiles, nil
+}
+
+func profileLabel(p zen.Profile) string {
+	var tags []string
+	if p.Default {
+		tags = append(tags, "default")
+	}
+	if zen.InUse(p.Path) {
+		tags = append(tags, "in use")
+	}
+	if _, err := os.Stat(filepath.Join(p.Path, "places.sqlite")); err != nil {
+		tags = append(tags, "empty")
+	}
+	l := p.Name
+	if len(tags) > 0 {
+		l += " [" + strings.Join(tags, ", ") + "]"
+	}
+	return l + "\n      " + p.Path
+}
+
+func pickProfile(ui *ui, profiles []zen.Profile, query, prompt string) (zen.Profile, error) {
+	if query != "" {
+		return zen.FindProfile(profiles, query)
+	}
+	if len(profiles) == 0 {
+		return zen.Profile{}, errors.New("no profiles found in profiles.ini")
+	}
+	if len(profiles) == 1 || !ui.tty {
+		return profiles[0], nil // sorted with the default first
+	}
+	i, err := ui.choose(prompt, lo.Map(profiles, func(p zen.Profile, _ int) string { return profileLabel(p) }), 0)
+	if err != nil {
+		return zen.Profile{}, err
+	}
+	return profiles[i], nil
+}
+
+func cmdList(c config) error {
+	root, profiles, err := loadProfiles(c)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Zen data dir: %s\n\nProfiles:\n", root)
+	for _, p := range profiles {
+		fmt.Printf("  - %s\n", profileLabel(p))
+	}
+	backups, _ := findBackups(c.backupDir)
+	fmt.Printf("\nBackups in %s:\n", c.backupDir)
+	if len(backups) == 0 {
+		fmt.Println("  (none)")
+	}
+	for _, b := range backups {
+		fmt.Printf("  - %s\n", backupLabel(b))
+	}
+	return nil
+}
+
+func cmdBackup(c config, ui *ui) error {
+	_, profiles, err := loadProfiles(c)
+	if err != nil && c.profile == "" {
+		return err
+	}
+	p, err := pickProfile(ui, profiles, c.profile, "Which profile do you want to back up?")
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(p.Path, "places.sqlite")); err != nil {
+		return fmt.Errorf("%s doesn't look like a used Zen profile (no places.sqlite)", p.Path)
+	}
+	if zen.InUse(p.Path) {
+		if !c.force {
+			return errors.New("zen is running with this profile; quit Zen first so databases are consistent (or pass --force)")
+		}
+		fmt.Fprintln(os.Stderr, "warning: Zen is running; the backup may be inconsistent")
+	}
+
+	now := time.Now()
+	out := c.output
+	switch {
+	case out == "":
+		out = filepath.Join(c.backupDir, backup.ArchiveName(p.Name, now))
+	case !strings.HasSuffix(out, ".tar.gz") && !strings.HasSuffix(out, ".tgz"):
+		out = filepath.Join(out, backup.ArchiveName(p.Name, now))
+	}
+
+	fmt.Printf("Backing up %q\n  from %s\n  to   %s\n", p.Name, p.Path, out)
+	m, err := backup.Create(p.Path, p.Name, zen.Version(p.Path), out, backup.Options{Slim: c.slim}, progressPrinter())
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return err
+	}
+	st, _ := os.Stat(out)
+	var size int64
+	if st != nil {
+		size = st.Size()
+	}
+	fmt.Printf("Done: %d files, %s of profile data -> %s archive\n%s\n", m.Files, humanBytes(m.Bytes), humanBytes(size), out)
+	return nil
+}
+
+type backupInfo struct {
+	path     string
+	manifest backup.Manifest
+	err      error
+}
+
+func findBackups(dir string) ([]backupInfo, error) {
+	paths := lo.FlatMap([]string{"*.tar.gz", "*.tgz"}, func(pattern string, _ int) []string {
+		matches, _ := filepath.Glob(filepath.Join(dir, pattern))
+		return matches
+	})
+	out := lo.Map(paths, func(p string, _ int) backupInfo {
+		m, err := backup.ReadManifest(p)
+		return backupInfo{p, m, err}
+	})
+	slices.SortFunc(out, func(a, b backupInfo) int { return b.manifest.CreatedAt.Compare(a.manifest.CreatedAt) })
+	return out, nil
+}
+
+func backupLabel(b backupInfo) string {
+	if b.err != nil {
+		return filepath.Base(b.path) + " (unreadable: " + b.err.Error() + ")"
+	}
+	m := b.manifest
+	extra := ""
+	if m.ZenVersion != "" {
+		extra += ", Zen " + m.ZenVersion
+	}
+	if m.Slim {
+		extra += ", slim"
+	}
+	return fmt.Sprintf("%s\n      profile %q from %s, %s%s, %s",
+		filepath.Base(b.path), m.ProfileName, m.OS,
+		m.CreatedAt.Local().Format("2006-01-02 15:04"), extra, humanBytes(m.Bytes))
+}
+
+func cmdRestore(c config, ui *ui, archive string) error {
+	if archive == "" {
+		backups, _ := findBackups(c.backupDir)
+		valid := lo.Filter(backups, func(b backupInfo, _ int) bool { return b.err == nil })
+		if len(valid) == 0 {
+			return fmt.Errorf("no backups found in %s; pass the archive path explicitly", c.backupDir)
+		}
+		if !ui.tty {
+			return errors.New("specify the archive to restore")
+		}
+		labels := lo.Map(valid, func(b backupInfo, _ int) string { return backupLabel(b) })
+		i, err := ui.choose("Which backup do you want to restore?", labels, 0)
+		if err != nil {
+			return err
+		}
+		archive = valid[i].path
+	}
+	m, err := backup.ReadManifest(archive)
+	if err != nil {
+		return err
+	}
+
+	root, profiles, err := loadProfiles(c)
+	if err != nil {
+		return err
+	}
+
+	newName := c.newName
+	var target zen.Profile
+	switch {
+	case newName == "" && c.profile != "":
+		if target, err = zen.FindProfile(profiles, c.profile); err != nil {
+			return err
+		}
+	case newName == "":
+		if !ui.tty {
+			return errors.New("specify --profile to overwrite or --new to create a profile")
+		}
+		labels := append([]string{"Create a new profile (safest)"},
+			lo.Map(profiles, func(p zen.Profile, _ int) string { return "Overwrite " + profileLabel(p) })...)
+		i, err := ui.choose("Restore into:", labels, 0)
+		if err != nil {
+			return err
+		}
+		if i == 0 {
+			def := m.ProfileName + " restored"
+			if newName, err = ui.ask(fmt.Sprintf("Name for the new profile [%s]: ", def)); err != nil {
+				return err
+			}
+			if newName == "" {
+				newName = def
+			}
+		} else {
+			target = profiles[i-1]
+		}
+	}
+
+	if newName != "" {
+		if lo.SomeBy(profiles, func(p zen.Profile) bool { return zen.InUse(p.Path) }) {
+			return errors.New("quit Zen before creating a new profile (it rewrites profiles.ini on exit)")
+		}
+		if lo.SomeBy(profiles, func(p zen.Profile) bool { return strings.EqualFold(p.Name, newName) }) {
+			return fmt.Errorf("a profile named %q already exists", newName)
+		}
+		dir, err := zen.NewProfileDir(root, sanitizeDirName(newName))
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Restoring %s\n  into new profile %q at %s\n", filepath.Base(archive), newName, dir)
+		if _, err := backup.Restore(archive, dir, false, progressPrinter()); err != nil {
+			fmt.Fprintln(os.Stderr)
+			return err
+		}
+		fmt.Fprintln(os.Stderr)
+		if err := zen.RegisterProfile(root, newName, dir); err != nil {
+			return fmt.Errorf("profile restored to %s but registering it in profiles.ini failed: %w", dir, err)
+		}
+		fmt.Printf("Done. Pick %q in about:profiles, or launch with:\n  zen --profile %q\n", newName, dir)
+		return nil
+	}
+
+	if zen.InUse(target.Path) {
+		return fmt.Errorf("zen is running with profile %q; quit it first", target.Name)
+	}
+	fmt.Printf("Restoring %s\n  over profile %q at %s\n", filepath.Base(archive), target.Name, target.Path)
+	if !c.noKeepOld {
+		fmt.Println("  (the current profile will be kept as a .pre-restore copy)")
+	} else {
+		fmt.Println("  WARNING: the current profile will be deleted")
+	}
+	if !c.yes {
+		if !ui.tty {
+			return errors.New("refusing to overwrite without confirmation; pass --yes")
+		}
+		ok, err := ui.confirm("Continue?")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("aborted")
+		}
+	}
+	res, err := backup.Restore(archive, target.Path, !c.noKeepOld, progressPrinter())
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return err
+	}
+	fmt.Println("Done. Start Zen to use the restored profile.")
+	if res.PreviousDir != "" {
+		fmt.Printf("Previous profile kept at:\n  %s\nDelete it once you're happy with the restore.\n", res.PreviousDir)
+	}
+	return nil
+}
+
+var badDirChars = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1f]+`)
+
+func sanitizeDirName(s string) string {
+	s = strings.TrimSpace(badDirChars.ReplaceAllString(s, "-"))
+	if s == "" {
+		return "restored"
+	}
+	return s
+}
+
+func progressPrinter() backup.Progress {
+	if !term.IsTerminal(int(os.Stderr.Fd())) {
+		return nil
+	}
+	return func(files int, bytes int64) {
+		fmt.Fprintf(os.Stderr, "\r  %d files, %s ", files, humanBytes(bytes))
+	}
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+type ui struct {
+	in  *bufio.Reader
+	tty bool
+}
+
+func newUI() *ui {
+	return &ui{in: bufio.NewReader(os.Stdin), tty: term.IsTerminal(int(os.Stdin.Fd()))}
+}
+
+func (u *ui) ask(prompt string) (string, error) {
+	fmt.Print(prompt)
+	line, err := u.in.ReadString('\n')
+	if err != nil && line == "" {
+		fmt.Println()
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
+}
+
+func (u *ui) choose(prompt string, options []string, def int) (int, error) {
+	fmt.Println(prompt)
+	for i, o := range options {
+		fmt.Printf("  [%d] %s\n", i+1, o)
+	}
+	for {
+		ans, err := u.ask(fmt.Sprintf("Choice [%d]: ", def+1))
+		if err != nil {
+			return 0, err
+		}
+		if ans == "" {
+			return def, nil
+		}
+		if n, err := strconv.Atoi(ans); err == nil && n >= 1 && n <= len(options) {
+			return n - 1, nil
+		}
+		fmt.Println("Invalid choice.")
+	}
+}
+
+func (u *ui) confirm(prompt string) (bool, error) {
+	ans, err := u.ask(prompt + " [y/N]: ")
+	if err != nil {
+		return false, err
+	}
+	return strings.EqualFold(ans, "y") || strings.EqualFold(ans, "yes"), nil
+}
