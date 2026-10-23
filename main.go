@@ -253,7 +253,7 @@ func cmdBackup(c config, ui *ui) error {
 // archivePath returns where to write a new backup: --output if it names an
 // archive, otherwise a timestamped file in --output or --backup-dir.
 func archivePath(c config, profileName string) string {
-	if strings.HasSuffix(c.output, ".tar.gz") || strings.HasSuffix(c.output, ".tgz") {
+	if lo.SomeBy(backup.ArchiveExtensions, func(ext string) bool { return strings.HasSuffix(c.output, ext) }) {
 		return c.output
 	}
 	dir := lo.Ternary(c.output != "", c.output, c.backupDir)
@@ -276,8 +276,8 @@ type backupInfo struct {
 
 // findBackups lists the archives in dir, newest first.
 func findBackups(dir string) []backupInfo {
-	paths := lo.FlatMap([]string{"*.tar.gz", "*.tgz"}, func(pattern string, _ int) []string {
-		matches, _ := filepath.Glob(filepath.Join(dir, pattern))
+	paths := lo.FlatMap(backup.ArchiveExtensions, func(ext string, _ int) []string {
+		matches, _ := filepath.Glob(filepath.Join(dir, "*"+ext))
 		return matches
 	})
 	backups := lo.Map(paths, func(p string, _ int) backupInfo {

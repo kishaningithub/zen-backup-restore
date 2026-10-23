@@ -1,5 +1,9 @@
 # Agent instructions
 
+## Tooling
+
+- If [pkgx](https://pkgx.sh) is available on the machine, use it to run any tools you need (e.g. `pkgx zstd …`, `pkgx python@3.12 …`) instead of installing them globally.
+
 ## Code style
 
 - Ensure the code is very readable. Readability is greater than performance.

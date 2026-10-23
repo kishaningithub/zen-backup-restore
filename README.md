@@ -100,12 +100,16 @@ SQLite `-wal` files **are** included, so recent history isn't lost.
 
 - website storage (`storage/default/http*`): each site's IndexedDB, localStorage and offline caches
 - Zen's rolling session snapshots (`zen-sessions-backup/`)
-- Firefox's previous-session and per-update session snapshots (`sessionstore-backups/previous.jsonlz4`, `sessionstore-backups/upgrade.jsonlz4-*`)
+- Firefox's previous-session, per-update and previous crash-recovery snapshots (`sessionstore-backups/previous.jsonlz4`, `upgrade.jsonlz4-*`, `recovery.baklz4`), plus the crash-recovery copy `recovery.jsonlz4` when Zen was closed cleanly (it then restores from `sessionstore.jsonlz4`)
+- the daily automatic bookmark backups (`bookmarkbackups/`); bookmarks themselves are kept in `places.sqlite`
+- site icons (`favicons.sqlite`), refetched as you browse
+- downloaded blocklists and certificate revocation data (Remote Settings cache in `storage/permanent/chrome`, `security_state/`), re-downloaded automatically
+- all of uBlock Origin's stored data (tens of MB, mostly cached filter lists), so it starts with **default settings** after a restore; custom filters, allowlist and selected lists are reset
 
 Still kept:
 
 - bookmarks, history, passwords and cookies, so you stay logged in to most sites
-- extensions and their storage
+- extensions and their storage (except uBlock Origin's, see above)
 - prefs and `chrome/` customisations
 - the current session (`zen-sessions.jsonlz4`, `sessionstore-backups/recovery.jsonlz4`), so your spaces, pinned tabs and open tabs come back
 
@@ -113,11 +117,11 @@ Sites that keep data locally, such as offline web apps or some chat and mail cli
 
 `--exclude-sensitive` makes a backup that's safer to share or store somewhere untrusted. It skips:
 
-- saved passwords and the keys that decrypt them (`logins.json`, `key4.db`)
+- saved passwords and the keys that decrypt them (`logins.json`, `logins.db`, `key4.db`)
 - cookies (`cookies.sqlite`)
 - saved form and search entries (`formhistory.sqlite`)
 - saved addresses and cards (`autofill-profiles.json`)
-- Firefox account tokens (`signedInUser.json`)
+- Firefox account tokens and Sync state (`signedInUser.json`, `weave/`, `synced-tabs.db`)
 - website storage (localStorage/IndexedDB, which often hold login tokens)
 
 You'll need to log in to sites again after restoring. Some sensitive data is still included:

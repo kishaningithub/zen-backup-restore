@@ -25,6 +25,10 @@ const (
 	FormatVersion = 1
 )
 
+// ArchiveExtensions lists the backup file extensions this tool reads; new
+// backups use the first one.
+var ArchiveExtensions = []string{".tar.gz", ".tgz"}
+
 // Manifest describes where a backup came from so it can be relocated.
 type Manifest struct {
 	FormatVersion int       `json:"format_version"`
@@ -49,6 +53,10 @@ type Options struct {
 	// ExcludeSensitive skips passwords, cookies, form/autofill data,
 	// account tokens and website storage.
 	ExcludeSensitive bool
+
+	// slimResetExtensionData holds patterns for the data of
+	// slimResetExtensions; scanProfile fills it in from prefs.js.
+	slimResetExtensionData []string
 }
 
 // Paths that are caches, locks, telemetry or machine-specific binaries.
@@ -65,21 +73,30 @@ var alwaysExcluded = []string{
 	"*-shm", // sqlite shared-memory index, rebuilt on open
 }
 
+// Data Zen rebuilds or re-downloads on its own.
 var slimExcluded = []string{
 	"zen-sessions-backup",
 	"sessionstore-backups/upgrade.jsonlz4-*",
 	"sessionstore-backups/previous.jsonlz4",
+	"sessionstore-backups/recovery.baklz4",
+	"bookmarkbackups", // daily JSON copies of bookmarks already in places.sqlite
+	"favicons.sqlite*",
+	"security_state", // certificate revocation data
+	// Remote Settings cache (blocklists, security data); the name is a
+	// hash of "remote-settings", so it is the same in every profile.
+	"storage/permanent/chrome/idb/3870112724rsegmnoittet-es*",
 }
 
 // Files holding secrets. Patterns ending in * also cover SQLite -wal and
 // -journal siblings.
 var sensitiveExcluded = []string{
-	"logins*.json", "signons.sqlite*", // saved passwords
+	"logins*.json", "logins.db*", "signons.sqlite*", // saved passwords
 	"key4.db*", "key3.db*", // keys that decrypt passwords and cards
 	"cookies.sqlite*",
-	"formhistory.sqlite*",    // typed form and search entries
-	"autofill-profiles.json", // saved addresses and cards
-	"signedInUser.json",      // Firefox account tokens
+	"formhistory.sqlite*",      // typed form and search entries
+	"autofill-profiles.json",   // saved addresses and cards
+	"signedInUser.json",        // Firefox account tokens
+	"weave", "synced-tabs.db*", // Firefox Sync state and other devices' tabs
 	"credentialstate.sqlite*",
 	"webappsstore.sqlite*", "storage/ls-archive.sqlite*", // legacy site localStorage
 }
@@ -93,7 +110,7 @@ func Excluded(rel string, opts Options) bool {
 	matches := func(pattern string) bool { return matchesPattern(pattern, rel) }
 	isWebsiteStorage := websiteStorage.MatchString(rel)
 	return lo.SomeBy(alwaysExcluded, matches) ||
-		opts.Slim && (isWebsiteStorage || lo.SomeBy(slimExcluded, matches)) ||
+		opts.Slim && (isWebsiteStorage || lo.SomeBy(slimExcluded, matches) || lo.SomeBy(opts.slimResetExtensionData, matches)) ||
 		opts.ExcludeSensitive && (isWebsiteStorage || lo.SomeBy(sensitiveExcluded, matches))
 }
 
@@ -152,6 +169,9 @@ func Create(profileDir, profileName, zenVersion, archivePath string, opts Option
 
 // scanProfile lists the regular files and directories to back up.
 func scanProfile(profileDir string, opts Options) ([]profileEntry, error) {
+	if opts.Slim {
+		opts.slimResetExtensionData = extensionDataPatterns(profileDir, slimResetExtensions)
+	}
 	var entries []profileEntry
 	err := filepath.WalkDir(profileDir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || p == profileDir {
@@ -178,7 +198,20 @@ func scanProfile(profileDir string, opts Options) ([]profileEntry, error) {
 		entries = append(entries, profileEntry{rel, info})
 		return nil
 	})
+	if opts.Slim {
+		entries = dropRedundantCrashRecovery(entries)
+	}
 	return entries, err
+}
+
+// After a clean shutdown Zen restores from sessionstore.jsonlz4, so the
+// crash-recovery copy is a redundant duplicate of about the same size.
+func dropRedundantCrashRecovery(entries []profileEntry) []profileEntry {
+	hasCleanSession := lo.ContainsBy(entries, func(e profileEntry) bool { return e.rel == "sessionstore.jsonlz4" })
+	if !hasCleanSession {
+		return entries
+	}
+	return lo.Reject(entries, func(e profileEntry, _ int) bool { return e.rel == "sessionstore-backups/recovery.jsonlz4" })
 }
 
 // writeFileAtomically writes to a temporary file next to path and renames it
@@ -205,7 +238,10 @@ func writeFileAtomically(path string, write func(io.Writer) error) error {
 
 // writeArchive writes a gzipped tar with the manifest followed by the profile.
 func writeArchive(w io.Writer, profileDir string, m Manifest, entries []profileEntry, progress Progress) error {
-	gz := gzip.NewWriter(w)
+	gz, err := gzip.NewWriterLevel(w, gzip.BestCompression)
+	if err != nil {
+		return err
+	}
 	tw := tar.NewWriter(gz)
 
 	if err := writeManifest(tw, m); err != nil {
@@ -291,5 +327,5 @@ func ArchiveName(profileName string, t time.Time) string {
 	if n == "" {
 		n = "profile"
 	}
-	return fmt.Sprintf("zen-backup_%s_%s.tar.gz", n, t.Format("2006-01-02_15-04-05"))
+	return fmt.Sprintf("zen-backup_%s_%s%s", n, t.Format("2006-01-02_15-04-05"), ArchiveExtensions[0])
 }

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
 )
 
@@ -34,8 +35,17 @@ func TestExcluded(t *testing.T) {
 		{"sessionstore-backups/recovery.jsonlz4", false, false, false},
 		{"sessionstore-backups/upgrade.jsonlz4-20240101", false, true, false},
 		{"chrome/userChrome.css", false, false, false},
+		{"sessionstore-backups/recovery.baklz4", false, true, false},
+		{"bookmarkbackups/bookmarks-2026-10-22.jsonlz4", false, true, false},
+		{"favicons.sqlite-wal", false, true, false},
+		{"security_state/data.safe.bin", false, true, false},
+		{"storage/permanent/chrome/idb/3870112724rsegmnoittet-es.files", false, true, false},
+		{"storage/permanent/chrome/idb/1451318868ntouromlalnodry--epcr.sqlite", false, false, false},
+		{"storage/default/moz-extension+++abc^userContextId=4294967295/idb/3647222921wleabcEoxlt-eengsairo.sqlite", false, false, false},
 		{"logins.json", false, false, true},
 		{"logins-backup.json", false, false, true},
+		{"logins.db", false, false, true},
+		{"weave/bookmarks.sqlite", false, false, true},
 		{"key4.db", false, false, true},
 		{"cookies.sqlite", false, false, true},
 		{"cookies.sqlite-wal", false, false, true},
@@ -52,6 +62,45 @@ func TestExcluded(t *testing.T) {
 			require.Equal(t, c.excludedByNoSensitive, Excluded(c.rel, Options{ExcludeSensitive: true}), "exclude-sensitive backup")
 		})
 	}
+}
+
+func TestSlimSkipsCrashRecoveryOnlyAfterCleanShutdown(t *testing.T) {
+	relPaths := func(entries []profileEntry) []string {
+		return lo.Map(entries, func(e profileEntry, _ int) string { return e.rel })
+	}
+
+	crashed := t.TempDir()
+	writeFiles(t, crashed, map[string]string{"sessionstore-backups/recovery.jsonlz4": "x"})
+	entries, err := scanProfile(crashed, Options{Slim: true})
+	require.NoError(t, err)
+	require.Contains(t, relPaths(entries), "sessionstore-backups/recovery.jsonlz4")
+
+	clean := t.TempDir()
+	writeFiles(t, clean, map[string]string{"sessionstore.jsonlz4": "x", "sessionstore-backups/recovery.jsonlz4": "x"})
+	entries, err = scanProfile(clean, Options{Slim: true})
+	require.NoError(t, err)
+	require.Contains(t, relPaths(entries), "sessionstore.jsonlz4")
+	require.NotContains(t, relPaths(entries), "sessionstore-backups/recovery.jsonlz4")
+}
+
+func TestSlimDropsUBlockOriginData(t *testing.T) {
+	profile := t.TempDir()
+	writeFiles(t, profile, map[string]string{
+		"prefs.js": `user_pref("extensions.webextensions.uuids", "{\"uBlock0@raymondhill.net\":\"ubo-uuid\",\"other@ext\":\"other-uuid\"}");` + "\n",
+		"storage/default/moz-extension+++ubo-uuid/idb/cache.sqlite":                             "x",
+		"storage/default/moz-extension+++ubo-uuid^userContextId=4294967295/idb/settings.sqlite": "x",
+		"browser-extension-data/uBlock0@raymondhill.net/storage.js":                             "x",
+		"storage/default/moz-extension+++other-uuid/idb/data.sqlite":                            "x",
+	})
+
+	entries, err := scanProfile(profile, Options{Slim: true})
+	require.NoError(t, err)
+	files := lo.FilterMap(entries, func(e profileEntry, _ int) (string, bool) { return e.rel, !e.info.IsDir() })
+	require.ElementsMatch(t, []string{"prefs.js", "storage/default/moz-extension+++other-uuid/idb/data.sqlite"}, files)
+
+	entries, err = scanProfile(profile, Options{})
+	require.NoError(t, err)
+	require.Len(t, lo.Filter(entries, func(e profileEntry, _ int) bool { return !e.info.IsDir() }), 5, "full backups keep uBlock data")
 }
 
 func TestPathRewriterFromWindows(t *testing.T) {
