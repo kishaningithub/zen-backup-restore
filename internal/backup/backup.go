@@ -48,7 +48,8 @@ type Manifest struct {
 
 // Options control what goes into a backup.
 type Options struct {
-	// Slim skips website storage and rolling session snapshots.
+	// Slim skips website storage and rolling session snapshots, and
+	// compacts large SQLite databases.
 	Slim bool
 	// ExcludeSensitive skips passwords, cookies, form/autofill data,
 	// account tokens and website storage.
@@ -135,6 +136,7 @@ func matchesPattern(pattern, rel string) bool {
 type profileEntry struct {
 	rel  string // slash-separated path relative to the profile dir
 	info fs.FileInfo
+	src  string // file to read instead of the profile's own, if set
 }
 
 // Create writes a backup of profileDir to archivePath.
@@ -142,6 +144,14 @@ func Create(profileDir, profileName, zenVersion, archivePath string, opts Option
 	entries, err := scanProfile(profileDir, opts)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("scanning profile: %w", err)
+	}
+	if opts.Slim {
+		tempDir, err := os.MkdirTemp("", "zen-backup-sqlite-*")
+		if err != nil {
+			return Manifest{}, err
+		}
+		defer func() { _ = os.RemoveAll(tempDir) }()
+		entries = compactDatabases(profileDir, tempDir, entries)
 	}
 	files := lo.Filter(entries, func(e profileEntry, _ int) bool { return !e.info.IsDir() })
 
@@ -195,7 +205,7 @@ func scanProfile(profileDir string, opts Options) ([]profileEntry, error) {
 		if err != nil {
 			return err
 		}
-		entries = append(entries, profileEntry{rel, info})
+		entries = append(entries, profileEntry{rel: rel, info: info})
 		return nil
 	})
 	if opts.Slim {
@@ -291,7 +301,8 @@ func writeEntry(tw *tar.Writer, profileDir string, e profileEntry) error {
 	if err := tw.WriteHeader(hdr); err != nil {
 		return err
 	}
-	return copyFile(tw, filepath.Join(profileDir, filepath.FromSlash(e.rel)), hdr.Size)
+	src := lo.CoalesceOrEmpty(e.src, filepath.Join(profileDir, filepath.FromSlash(e.rel)))
+	return copyFile(tw, src, hdr.Size)
 }
 
 // copyFile writes exactly size bytes of src, tolerating files that changed

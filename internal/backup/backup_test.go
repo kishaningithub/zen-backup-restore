@@ -3,6 +3,7 @@ package backup
 import (
 	"archive/tar"
 	"compress/gzip"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -101,6 +102,56 @@ func TestSlimDropsUBlockOriginData(t *testing.T) {
 	entries, err = scanProfile(profile, Options{})
 	require.NoError(t, err)
 	require.Len(t, lo.Filter(entries, func(e profileEntry, _ int) bool { return !e.info.IsDir() }), 5, "full backups keep uBlock data")
+}
+
+func TestSlimCompactsLargeDatabasesWithoutTouchingTheProfile(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	require.NoError(t, os.MkdirAll(src, 0o755))
+	dbPath := filepath.Join(src, "places.sqlite")
+
+	// A WAL-mode database over the threshold whose latest row is still only
+	// in the -wal file, as when Zen has not yet checkpointed it.
+	db, err := sql.Open("sqlite", dbPath)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+	db.SetMaxOpenConns(1)
+	for _, stmt := range []string{
+		"PRAGMA journal_mode=WAL",
+		"CREATE TABLE t (name TEXT, data BLOB)",
+		"INSERT INTO t VALUES ('filler', zeroblob(12 * 1024 * 1024))",
+		"PRAGMA wal_checkpoint(TRUNCATE)",
+		"PRAGMA wal_autocheckpoint=0",
+		"DELETE FROM t",
+		"INSERT INTO t VALUES ('latest', NULL)",
+	} {
+		_, err := db.Exec(stmt)
+		require.NoError(t, err, stmt)
+	}
+	original, err := os.Stat(dbPath)
+	require.NoError(t, err)
+	require.FileExists(t, dbPath+"-wal")
+
+	archive := filepath.Join(tmp, "b.tar.gz")
+	m, err := Create(src, "p", "", archive, Options{Slim: true}, nil)
+	require.NoError(t, err)
+	require.Less(t, m.Bytes, int64(minCompactBytes))
+
+	current, err := os.Stat(dbPath)
+	require.NoError(t, err)
+	require.Equal(t, original.Size(), current.Size(), "profile database must not be modified")
+
+	dst := filepath.Join(tmp, "dst")
+	_, err = Restore(archive, dst, false, nil)
+	require.NoError(t, err)
+	require.NoFileExists(t, filepath.Join(dst, "places.sqlite-wal"))
+
+	restored, err := sql.Open("sqlite", filepath.Join(dst, "places.sqlite"))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, restored.Close()) }()
+	var name string
+	require.NoError(t, restored.QueryRow("SELECT name FROM t").Scan(&name))
+	require.Equal(t, "latest", name)
 }
 
 func TestPathRewriterFromWindows(t *testing.T) {

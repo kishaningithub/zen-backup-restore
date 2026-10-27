@@ -106,6 +106,8 @@ SQLite `-wal` files **are** included, so recent history isn't lost.
 - downloaded blocklists and certificate revocation data (Remote Settings cache in `storage/permanent/chrome`, `security_state/`), re-downloaded automatically
 - all of uBlock Origin's stored data (tens of MB, mostly cached filter lists), so it starts with **default settings** after a restore; custom filters, allowlist and selected lists are reset
 
+It also compacts SQLite databases larger than 10 MB (such as `places.sqlite`). A temporary copy of each one, including its `-wal` file, is run through `VACUUM` and that copy is archived instead of the original. Nothing is lost, and the profile itself is never modified. If a database cannot be vacuumed, the original is archived as is.
+
 Still kept:
 
 - bookmarks, history, passwords and cookies, so you stay logged in to most sites
