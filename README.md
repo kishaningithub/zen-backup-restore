@@ -28,10 +28,10 @@ scoop install kishaningithub/zen-backup-restore
 pkgx zen-backup-restore@latest list
 ```
 
-or if you prefer the env style which only adds zen-backup-restore to your current shell session
+or if you prefer the eval style which only adds zen-backup-restore to your current shell session
 
 ```bash
-env +zen-backup-restore@latest
+eval $(pkgx +zen-backup-restore@latest)
 
 zen-backup-restore list
 ```
