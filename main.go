@@ -111,7 +111,7 @@ Run without a command for an interactive menu.`,
 	bf := backupCmd.Flags()
 	bf.StringVarP(&c.profile, "profile", "p", "", "profile name or path to back up (default: Zen's default profile)")
 	bf.StringVarP(&c.output, "output", "o", "", "backup directory or .tar.gz path (default: --backup-dir)")
-	bf.BoolVar(&c.slim, "slim", false, "skip website storage and old session snapshots")
+	bf.BoolVar(&c.slim, "slim", false, "skip website storage and old session snapshots, and compact large databases")
 	bf.BoolVar(&c.excludeSensitive, "exclude-sensitive", false, "skip passwords, cookies, form/autofill data, account tokens and website storage")
 	bf.BoolVar(&c.force, "force", false, "back up even if Zen is running (may be inconsistent)")
 
